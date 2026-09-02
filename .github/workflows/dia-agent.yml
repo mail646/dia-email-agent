@@ -1,0 +1,59 @@
+name: DIA Email Agent
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+    - cron: '0 14 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  ingest-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install google-generativeai pypdf python-docx
+
+      - name: Run ingestion
+        env:
+          ICLOUD_EMAIL: ${{ secrets.ICLOUD_EMAIL }}
+          ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python3 ingest.py
+
+      - name: Build board
+        run: python3 build_board.py
+
+      - name: Commit updated database
+        run: |
+          git config user.name "DIA Agent Bot"
+          git config user.email "actions@github.com"
+          git add dia_events.db
+          git diff --staged --quiet || git commit -m "Update events database"
+          git push
+
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p _site
+          cp board.html _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
