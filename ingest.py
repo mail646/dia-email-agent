@@ -158,46 +158,72 @@ def get_email_body_and_attachments(msg):
 
 
 def fetch_new_school_emails(imap_conn, limit=50):
-    status, _ = imap_conn.select("INBOX")
-    if status != "OK":
-        print("WARNING: could not select INBOX")
-        return []
-
-    search_query = f'(FROM "{SCHOOL_DOMAIN}")'
-    status, data = imap_conn.search(None, search_query)
-    print(f"DEBUG: search status={status}, raw data={data}")
-    if status != "OK" or not data or data[0] is None:
-        print(f"WARNING: search returned no usable data (status={status})")
-        return []
-
-    message_nums = data[0].split()
-
-    message_nums = message_nums[-limit:]
-
     emails = []
-    for num in message_nums:
-        status, msg_data = imap_conn.fetch(num, "(RFC822)")
+
+    status, folder_list = imap_conn.list()
+    if status != "OK" or not folder_list:
+        print("WARNING: could not list folders")
+        return []
+
+    folder_names = []
+    for entry in folder_list:
+        if not entry:
+            continue
+        decoded = entry.decode(errors="ignore")
+        # folder name is the last quoted segment
+        if '"' in decoded:
+            parts = decoded.split('"')
+            if len(parts) >= 2:
+                folder_names.append(parts[-2])
+
+    print(f"DEBUG: found {len(folder_names)} folders: {folder_names}")
+
+    for folder in folder_names:
+        try:
+            status, _ = imap_conn.select(f'"{folder}"', readonly=True)
+        except Exception as e:
+            print(f"DEBUG: could not select folder {folder}: {e}")
+            continue
         if status != "OK":
             continue
-        raw_email = msg_data[0][1]
-        msg = email.message_from_bytes(raw_email)
 
-        message_id = msg.get("Message-ID", f"no-id-{num.decode()}")
-        subject = decode_mime_words(msg.get("Subject", ""))
-        sender = decode_mime_words(msg.get("From", ""))
-        date_str = msg.get("Date", "")
+        search_query = f'(FROM "{SCHOOL_DOMAIN}")'
+        status, data = imap_conn.search(None, search_query)
+        if status != "OK" or not data or data[0] is None:
+            continue
 
-        body, attachment_text = get_email_body_and_attachments(msg)
+        message_nums = data[0].split()
+        if not message_nums:
+            continue
 
-        emails.append({
-            "message_id": message_id,
-            "subject": subject,
-            "sender": sender,
-            "date": date_str,
-            "body": body,
-            "attachment_text": attachment_text,
-        })
+        print(f"DEBUG: folder '{folder}' has {len(message_nums)} matching emails")
+        message_nums = message_nums[-limit:]
+
+        for num in message_nums:
+            status, msg_data = imap_conn.fetch(num, "(RFC822)")
+            if status != "OK":
+                continue
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            message_id = msg.get("Message-ID", f"no-id-{folder}-{num.decode()}")
+            subject = decode_mime_words(msg.get("Subject", ""))
+            sender = decode_mime_words(msg.get("From", ""))
+            date_str = msg.get("Date", "")
+
+            body, attachment_text = get_email_body_and_attachments(msg)
+
+            emails.append({
+                "message_id": message_id,
+                "subject": subject,
+                "sender": sender,
+                "date": date_str,
+                "body": body,
+                "attachment_text": attachment_text,
+            })
+
     return emails
+
 
 
 def extract_events_with_gemini(model, email_data):
