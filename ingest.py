@@ -227,7 +227,7 @@ def fetch_new_school_emails(imap_conn, limit=50):
 
 
 
-def extract_events_with_gemini(model, email_data):
+def extract_events_with_gemini(model, email_data, max_retries=3):
     full_content = f"""Subject: {email_data['subject']}
 From: {email_data['sender']}
 Date: {email_data['date']}
@@ -238,10 +238,25 @@ Body:
 {email_data['attachment_text']}
 """
 
-    response = model.generate_content(
-        [EXTRACTION_SYSTEM_PROMPT, full_content],
-        generation_config={"response_mime_type": "application/json"},
-    )
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                [EXTRACTION_SYSTEM_PROMPT, full_content],
+                generation_config={"response_mime_type": "application/json"},
+            )
+            break
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                wait = 40 * (attempt + 1)
+                print(f"WARNING: rate limited, waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+            else:
+                print(f"WARNING: Gemini call failed: {e}")
+                return []
+    else:
+        print("WARNING: gave up after retries due to rate limiting")
+        return []
 
     text = (response.text or "").strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -251,6 +266,7 @@ Body:
     except json.JSONDecodeError:
         print(f"WARNING: could not parse Gemini response for '{email_data['subject']}':\n{text}")
         return []
+
 
 
 def save_events(conn, email_data, events):
