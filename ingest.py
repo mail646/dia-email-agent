@@ -158,13 +158,20 @@ def get_email_body_and_attachments(msg):
 
 
 def fetch_new_school_emails(imap_conn, limit=50):
-    imap_conn.select("INBOX")
+    status, _ = imap_conn.select("INBOX")
+    if status != "OK":
+        print("WARNING: could not select INBOX")
+        return []
+
     search_query = f'(FROM "{SCHOOL_DOMAIN}")'
     status, data = imap_conn.search(None, search_query)
-    if status != "OK":
+    print(f"DEBUG: search status={status}, raw data={data}")
+    if status != "OK" or not data or data[0] is None:
+        print(f"WARNING: search returned no usable data (status={status})")
         return []
 
     message_nums = data[0].split()
+
     message_nums = message_nums[-limit:]
 
     emails = []
