@@ -15,8 +15,10 @@ import os
 import sys
 from datetime import datetime, timezone
 import io
+import time
 
 import google.generativeai as genai
+
 
 ICLOUD_EMAIL = os.environ.get("ICLOUD_EMAIL", "your_icloud_email@icloud.com")
 ICLOUD_APP_PASSWORD = os.environ.get("ICLOUD_APP_PASSWORD", "xxxx-xxxx-xxxx-xxxx")
