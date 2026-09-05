@@ -13,12 +13,11 @@ import sqlite3
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 import io
-import time
 
 import google.generativeai as genai
-
 
 ICLOUD_EMAIL = os.environ.get("ICLOUD_EMAIL", "your_icloud_email@icloud.com")
 ICLOUD_APP_PASSWORD = os.environ.get("ICLOUD_APP_PASSWORD", "xxxx-xxxx-xxxx-xxxx")
@@ -30,7 +29,6 @@ DB_PATH = os.environ.get("DIA_DB_PATH", os.path.join(os.path.dirname(__file__), 
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
-
 
 YEAR_GROUPS = ["Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9", "Year 10", "Year 11", "Year 12", "Year 13", "All"]
 
@@ -161,6 +159,7 @@ def get_email_body_and_attachments(msg):
 
 
 def fetch_new_school_emails(imap_conn, limit=8):
+    emails = []
 
     status, folder_list = imap_conn.list()
     if status != "OK" or not folder_list:
@@ -172,7 +171,6 @@ def fetch_new_school_emails(imap_conn, limit=8):
         if not entry:
             continue
         decoded = entry.decode(errors="ignore")
-        # folder name is the last quoted segment
         if '"' in decoded:
             parts = decoded.split('"')
             if len(parts) >= 2:
@@ -227,11 +225,7 @@ def fetch_new_school_emails(imap_conn, limit=8):
     return emails
 
 
-
-                events = extract_events_with_gemini(model, email_data)
-        time.sleep(6)
-
-
+def extract_events_with_gemini(model, email_data, max_retries=3):
     full_content = f"""Subject: {email_data['subject']}
 From: {email_data['sender']}
 Date: {email_data['date']}
@@ -242,6 +236,7 @@ Body:
 {email_data['attachment_text']}
 """
 
+    response = None
     for attempt in range(max_retries):
         try:
             response = model.generate_content(
@@ -262,6 +257,9 @@ Body:
         print("WARNING: gave up after retries due to rate limiting")
         return []
 
+    if response is None:
+        return []
+
     text = (response.text or "").strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
@@ -270,7 +268,6 @@ Body:
     except json.JSONDecodeError:
         print(f"WARNING: could not parse Gemini response for '{email_data['subject']}':\n{text}")
         return []
-
 
 
 def save_events(conn, email_data, events):
@@ -318,6 +315,8 @@ def main():
         print(f"Processing: {email_data['subject'][:60]}...")
 
         events = extract_events_with_gemini(model, email_data)
+        time.sleep(6)
+
         if events:
             save_events(db_conn, email_data, events)
             print(f"  -> extracted {len(events)} item(s)")
