@@ -186,12 +186,49 @@ def extract_attachment_text(part):
                         if ocr_text and not ocr_text.startswith("[Could not"):
                             text_parts.append(f"[OCR from page image]\n{ocr_text}")
             return "\n".join(text_parts)
-        elif lower.endswith(".docx") or "wordprocessingml" in content_type:
+
+        elif lower.endswith(".docx") or "wordprocessingml.document" in content_type:
             import docx
             doc = docx.Document(io.BytesIO(payload))
             return "\n".join(p.text for p in doc.paragraphs)
+
+        elif lower.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in content_type:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(payload), data_only=True, read_only=True)
+            text_parts = []
+            for sheet in wb.worksheets:
+                text_parts.append(f"[Sheet: {sheet.title}]")
+                for row in sheet.iter_rows(values_only=True):
+                    line = " | ".join(str(c) for c in row if c is not None)
+                    if line.strip():
+                        text_parts.append(line)
+            return "\n".join(text_parts)
+
+        elif lower.endswith(".pptx") or "presentationml" in content_type:
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(payload))
+            text_parts = []
+            for i, slide in enumerate(prs.slides):
+                text_parts.append(f"[Slide {i+1}]")
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            line = "".join(run.text for run in para.runs)
+                            if line.strip():
+                                text_parts.append(line)
+                    if shape.shape_type == 13:  # picture
+                        try:
+                            img_bytes = shape.image.blob
+                            ocr_text = ocr_image_bytes(img_bytes, f"slide {i+1} image")
+                            if ocr_text and not ocr_text.startswith("[Could not"):
+                                text_parts.append(f"[OCR from slide {i+1} image]\n{ocr_text}")
+                        except Exception:
+                            pass
+            return "\n".join(text_parts)
+
         elif lower.endswith(".txt") or content_type == "text/plain":
             return payload.decode("utf-8", errors="ignore")
+
         elif lower.endswith(IMAGE_EXTENSIONS) or content_type.startswith("image/"):
             ocr_text = ocr_image_bytes(payload, filename)
             return f"[OCR from image {filename}]\n{ocr_text}" if ocr_text else ""
