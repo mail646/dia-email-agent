@@ -228,8 +228,9 @@ def fetch_new_school_emails(imap_conn, limit=8):
 
 
 
-        events = extract_events_with_gemini(model, email_data)
+                events = extract_events_with_gemini(model, email_data)
         time.sleep(6)
+
 
     full_content = f"""Subject: {email_data['subject']}
 From: {email_data['sender']}
