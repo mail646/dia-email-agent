@@ -160,8 +160,7 @@ def get_email_body_and_attachments(msg):
     return body.strip(), "\n\n".join(attachment_text_blocks)
 
 
-def fetch_new_school_emails(imap_conn, limit=50):
-    emails = []
+def fetch_new_school_emails(imap_conn, limit=8):
 
     status, folder_list = imap_conn.list()
     if status != "OK" or not folder_list:
@@ -229,7 +228,9 @@ def fetch_new_school_emails(imap_conn, limit=50):
 
 
 
-def extract_events_with_gemini(model, email_data, max_retries=3):
+        events = extract_events_with_gemini(model, email_data)
+        time.sleep(6)
+
     full_content = f"""Subject: {email_data['subject']}
 From: {email_data['sender']}
 Date: {email_data['date']}
