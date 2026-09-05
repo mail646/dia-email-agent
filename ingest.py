@@ -158,7 +158,7 @@ def get_email_body_and_attachments(msg):
     return body.strip(), "\n\n".join(attachment_text_blocks)
 
 
-def fetch_new_school_emails(imap_conn, limit=8):
+def fetch_new_school_emails(imap_conn, limit=3):
     emails = []
 
     status, folder_list = imap_conn.list()
