@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 DIA Emirates Hills email ingestion agent.
-Connects to iCloud Mail via IMAP, pulls new emails from the school domain,
-extracts text from PDFs/DOCX/images (via OCR) and HTML bodies,
-batches everything into a single Gemini call for structured extraction,
-and stores results in SQLite.
+Connects to iCloud Mail via IMAP, pulls new emails from the school domain
+(2025 onwards), extracts text from PDFs/DOCX/XLSX/PPTX/images (via OCR)
+and HTML bodies, batches everything into a single Gemini call for
+structured extraction, and stores results in SQLite.
 """
 
 import imaplib
@@ -45,8 +45,9 @@ TOPICS = ["Academic", "Admin", "CCAs", "Clinic", "Events", "PE", "Payments"]
 EXTRACTION_SYSTEM_PROMPT = f"""You extract actionable information from school emails for busy parents.
 
 You will receive several emails, each marked with a line like "=== EMAIL 0 ===", "=== EMAIL 1 ===", etc.
-Some emails include text extracted from PDF/Word attachments or OCR'd from images (photos of flyers, posters,
-forms) — treat this extracted text with the same importance as the email body itself, even if it has OCR noise/typos.
+Some emails include text extracted from PDF/Word/Excel/PowerPoint attachments or OCR'd from images (photos of
+flyers, posters, forms) — treat this extracted text with the same importance as the email body itself, even if
+it has OCR noise/typos.
 
 For each email, identify:
 - Any deadlines, events, tasks, or announcements with a date attached
@@ -108,7 +109,6 @@ def init_db():
             processed_at TEXT
         )
     """)
-    # migrate older DBs that may be missing new columns
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     for col in ["topic", "conflict_note"]:
         if col not in existing_cols:
@@ -216,7 +216,7 @@ def extract_attachment_text(part):
                             line = "".join(run.text for run in para.runs)
                             if line.strip():
                                 text_parts.append(line)
-                    if shape.shape_type == 13:  # picture
+                    if shape.shape_type == 13:
                         try:
                             img_bytes = shape.image.blob
                             ocr_text = ocr_image_bytes(img_bytes, f"slide {i+1} image")
