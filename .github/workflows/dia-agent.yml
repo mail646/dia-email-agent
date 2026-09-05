@@ -39,7 +39,7 @@ jobs:
           ICLOUD_EMAIL: ${{ secrets.ICLOUD_EMAIL }}
           ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-run: python3 -u ingest.py
+        run: python3 -u ingest.py
 
       - name: Build board
         run: python3 build_board.py
