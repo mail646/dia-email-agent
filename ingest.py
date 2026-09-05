@@ -315,7 +315,7 @@ def main():
         print(f"Processing: {email_data['subject'][:60]}...")
 
         events = extract_events_with_gemini(model, email_data)
-        time.sleep(6)
+        time.sleep(15)
 
         if events:
             save_events(db_conn, email_data, events)
