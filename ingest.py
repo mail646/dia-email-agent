@@ -35,11 +35,12 @@ DB_PATH = os.environ.get("DIA_DB_PATH", os.path.join(os.path.dirname(__file__), 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
 
-TOTAL_EMAIL_LIMIT = 10  # cap per run, across all folders combined
+TOTAL_EMAIL_LIMIT = 10
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
 YEAR_GROUPS = ["Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9", "Year 10", "Year 11", "Year 12", "Year 13", "All"]
+TOPICS = ["Academic", "Admin", "CCAs", "Clinic", "Events", "PE", "Payments"]
 
 EXTRACTION_SYSTEM_PROMPT = f"""You extract actionable information from school emails for busy parents.
 
@@ -50,7 +51,11 @@ forms) — treat this extracted text with the same importance as the email body 
 For each email, identify:
 - Any deadlines, events, tasks, or announcements with a date attached
 - Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}; use "All" if it applies to the whole school or is unclear)
+- Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)})
 - A short, clear summary a busy parent can scan in 5 seconds
+- If this item's date/time appears to CONTRADICT another item in this same batch (e.g. two emails give different
+  deadlines for what looks like the same thing), add a short "conflict_note" explaining the discrepancy and which
+  one seems more authoritative. Otherwise leave conflict_note null. Do not force a conflict if unsure.
 
 Respond ONLY with a single JSON array (no markdown fences, no preamble) combining items from ALL emails. Each item:
 {{
@@ -59,7 +64,9 @@ Respond ONLY with a single JSON array (no markdown fences, no preamble) combinin
   "date": "YYYY-MM-DD or null if no specific date",
   "category": "deadline | event | task | announcement",
   "year_group": "one of the allowed values above",
-  "summary": "1-2 sentence summary of what the parent needs to know or do"
+  "topic": "one of the allowed topic values above",
+  "summary": "1-2 sentence summary of what the parent needs to know or do",
+  "conflict_note": "explanation if this conflicts with another item, else null"
 }}
 
 The "email_index" field MUST match the number in that email's "=== EMAIL N ===" marker.
@@ -86,7 +93,9 @@ def init_db():
             date TEXT,
             category TEXT,
             year_group TEXT,
+            topic TEXT,
             summary TEXT,
+            conflict_note TEXT,
             email_subject TEXT,
             email_sender TEXT,
             email_date TEXT,
@@ -99,6 +108,14 @@ def init_db():
             processed_at TEXT
         )
     """)
+    # migrate older DBs that may be missing new columns
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    for col in ["topic", "conflict_note"]:
+        if col not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
     conn.commit()
     return conn
 
@@ -127,7 +144,6 @@ def decode_mime_words(s):
 
 
 def html_to_text(raw_html):
-    """Minimal HTML-to-text fallback: strip tags, unescape entities, collapse whitespace."""
     if not raw_html:
         return ""
     text = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", "", raw_html)
@@ -164,7 +180,6 @@ def extract_attachment_text(part):
             for page in reader.pages:
                 page_text = page.extract_text() or ""
                 text_parts.append(page_text)
-                # PDFs can also contain scanned images with no extractable text layer
                 if not page_text.strip():
                     for img_obj in getattr(page, "images", []):
                         ocr_text = ocr_image_bytes(img_obj.data, filename)
@@ -235,7 +250,6 @@ def get_folder_names(imap_conn):
     status, folder_list = imap_conn.list()
     if status != "OK" or not folder_list:
         return []
-
     folder_names = []
     for entry in folder_list:
         if not entry:
@@ -250,18 +264,13 @@ def get_folder_names(imap_conn):
 
 def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
     emails = []
-
     all_folders = get_folder_names(imap_conn)
-    folder_names = [
-        f for f in all_folders
-        if not any(kw in f.lower() for kw in SKIP_FOLDER_KEYWORDS)
-    ]
+    folder_names = [f for f in all_folders if not any(kw in f.lower() for kw in SKIP_FOLDER_KEYWORDS)]
     print(f"DEBUG: searching {len(folder_names)} folders (skipped {len(all_folders) - len(folder_names)} junk/trash/sent/etc.)")
 
     for folder in folder_names:
         if len(emails) >= total_limit:
             break
-
         try:
             status, _ = imap_conn.select(f'"{folder}"', readonly=True)
         except Exception:
@@ -269,7 +278,7 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
         if status != "OK":
             continue
 
-        search_query = f'(FROM "{SCHOOL_DOMAIN}")'
+        search_query = f'(FROM "{SCHOOL_DOMAIN}" SINCE "01-Jan-2025")'
         status, data = imap_conn.search(None, search_query)
         if status != "OK" or not data or data[0] is None:
             continue
@@ -277,19 +286,16 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
         message_nums = data[0].split()
         if not message_nums:
             continue
-
-        message_nums = list(reversed(message_nums))  # most recent first
+        message_nums = list(reversed(message_nums))
 
         for num in message_nums:
             if len(emails) >= total_limit:
                 break
-
             status, msg_data = imap_conn.fetch(num, "(RFC822)")
             if status != "OK":
                 continue
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
-
             message_id = msg.get("Message-ID", f"no-id-{folder}-{num.decode()}")
 
             if already_processed(db_conn, message_id):
@@ -316,7 +322,6 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
 
 
 def extract_events_batch(model, emails_batch, max_retries=3):
-    """Send multiple emails in ONE Gemini call to conserve free-tier quota."""
     combined = ""
     for i, ed in enumerate(emails_batch):
         combined += f"\n=== EMAIL {i} ===\nSubject: {ed['subject']}\nFrom: {ed['sender']}\nDate: {ed['date']}\n\nBody:\n{ed['body']}\n\n{ed['attachment_text']}\n"
@@ -358,16 +363,18 @@ def extract_events_batch(model, emails_batch, max_retries=3):
 def save_events(conn, email_data, events):
     for ev in events:
         conn.execute("""
-            INSERT INTO events (source_message_id, title, date, category, year_group,
-                                 summary, email_subject, email_sender, email_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (source_message_id, title, date, category, year_group, topic,
+                                 summary, conflict_note, email_subject, email_sender, email_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             email_data["message_id"],
             ev.get("title"),
             ev.get("date"),
             ev.get("category"),
             ev.get("year_group"),
+            ev.get("topic"),
             ev.get("summary"),
+            ev.get("conflict_note"),
             email_data["subject"],
             email_data["sender"],
             email_data["date"],
@@ -383,6 +390,10 @@ def main():
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(MODEL)
     db_conn = init_db()
+
+    deleted = db_conn.execute("DELETE FROM events WHERE date IS NOT NULL AND date < '2025-01-01'").rowcount
+    db_conn.commit()
+    print(f"DEBUG: cleared {deleted} old event(s) from before 2025")
 
     print("Connecting to iCloud Mail...")
     imap_conn = imap_connect()
@@ -414,7 +425,6 @@ def main():
                 mark_processed(db_conn, email_data["message_id"])
 
     print("\nDone.")
-
     imap_conn.logout()
     db_conn.close()
 
