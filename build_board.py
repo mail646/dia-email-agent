@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Reads dia_events.db and generates a single self-contained HTML board
-with tabs (Deadlines/Events/Calendar/All Items), search, topic
-filters, urgency-colored deadlines, relative date labels, and a
-collapsible "Passed" section.
+with a child selector (by year group), tabs (Deadlines/Events/Calendar/
+All Items), fuzzy search, topic filters, urgency-colored deadlines,
+relative date labels, and a collapsible "Passed" section.
 """
 
 import sqlite3
@@ -70,6 +70,12 @@ def build_html(rows):
     color: var(--muted); transition: all 0.15s;
   }}
   .chip.active {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
+  .child-chip {{
+    padding: 9px 18px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--card); font-size: 0.88em; font-weight: 600; cursor: pointer;
+    color: var(--ink); box-shadow: var(--shadow);
+  }}
+  .child-chip.active {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
   .tabs {{
     display: flex; gap: 2px; margin-bottom: 24px; border-bottom: 1px solid var(--line);
     overflow-x: auto;
@@ -150,6 +156,7 @@ def build_html(rows):
     before acting on anything.
   </div>
 
+  <div class="toolbar" id="childChips"></div>
   <input type="text" id="search" placeholder="Search titles, summaries..." oninput="render()">
   <div class="toolbar" id="topicChips"></div>
 
@@ -171,7 +178,14 @@ const DATA = {data_json};
 const CATEGORY_COLORS = {{deadline:'#c0392b', event:'#1a7a6a', task:'#c98a1c', announcement:'#8a8a8e'}};
 const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items'}};
 
+const CHILDREN = [
+  {{ id: 'All', label: 'All' }},
+  {{ id: 'Evelyn', label: 'Evelyn · Year 5', years: ['Year 5'] }},
+  {{ id: 'Milo', label: 'Milo · Year 8', years: ['Year 8'] }},
+];
+
 let activeTopic = 'All';
+let activeChild = 'All';
 let currentTab = 'deadlines';
 let calMonth = new Date();
 let showPassedDeadlines = false;
@@ -220,10 +234,45 @@ function isPast(dateStr) {{
   return dateStr < todayStr();
 }}
 
+function levenshtein(a, b) {{
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = Array.from({{length: m+1}}, () => new Array(n+1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {{
+    for (let j = 1; j <= n; j++) {{
+      dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+    }}
+  }}
+  return dp[m][n];
+}}
+
+function fuzzyIncludes(haystack, needle) {{
+  if (!needle) return true;
+  if (haystack.includes(needle)) return true;
+  const words = haystack.split(/\\s+/);
+  for (const w of words) {{
+    if (w.length < 3) continue;
+    const maxDist = w.length <= 5 ? 1 : 2;
+    if (levenshtein(w.slice(0, needle.length + 2), needle) <= maxDist) return true;
+  }}
+  return false;
+}}
+
 function matchesFilters(item) {{
-  const q = document.getElementById('search').value.toLowerCase();
-  if (q && !(`${{item.title}} ${{item.summary}} ${{item.year_group}}`.toLowerCase().includes(q))) return false;
+  const q = document.getElementById('search').value.toLowerCase().trim();
+  if (q) {{
+    const haystack = `${{item.title}} ${{item.summary}} ${{item.year_group}}`.toLowerCase();
+    if (!fuzzyIncludes(haystack, q)) return false;
+  }}
   if (activeTopic !== 'All' && item.topic !== activeTopic) return false;
+  if (activeChild !== 'All') {{
+    const child = CHILDREN.find(c => c.id === activeChild);
+    const yg = item.year_group || '';
+    if (yg !== 'All' && !child.years.includes(yg)) return false;
+  }}
   return true;
 }}
 
@@ -348,6 +397,19 @@ function setTopic(t) {{
   render();
 }}
 
+function buildChildChips() {{
+  document.getElementById('childChips').innerHTML = CHILDREN.map(c =>
+    `<div class="child-chip ${{c.id === activeChild ? 'active' : ''}}" onclick="setChild('${{c.id}}')">${{c.label}}</div>`
+  ).join('');
+}}
+
+function setChild(id) {{
+  activeChild = id;
+  buildChildChips();
+  render();
+}}
+
+buildChildChips();
 buildTopicChips();
 render();
 </script>
