@@ -10,6 +10,7 @@ structured extraction, and stores results in SQLite.
 import imaplib
 import email
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 import sqlite3
 import json
 import os
@@ -141,6 +142,21 @@ def decode_mime_words(s):
         (p.decode(enc or "utf-8", errors="ignore") if isinstance(p, bytes) else p)
         for p, enc in parts
     )
+
+
+def parse_email_date(date_str):
+    """Parse an RFC 2822 email Date header into an aware datetime for sorting.
+    Falls back to the minimum possible datetime (so unparseable dates sort last,
+    not first) if parsing fails."""
+    if not date_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = parsedate_to_datetime(date_str)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def html_to_text(raw_html):
@@ -300,14 +316,30 @@ def get_folder_names(imap_conn):
 
 
 def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
-    emails = []
+    """
+    Two-pass fetch:
+      1. Scan every non-skipped folder and pull just headers (cheap) for
+         unprocessed diadubai.com emails since 2025, recording each one's
+         actual email date.
+      2. Sort ALL candidates across every folder by date, newest first, and
+         only download the full body/attachments for the top `total_limit`.
+
+    This matters because folders are otherwise visited in whatever order
+    imap_conn.list() returns them. If an earlier folder (e.g. Inbox) has a
+    large backlog of unprocessed matches, it can consume the entire
+    per-run budget before a nested folder (e.g. "Dubai/DIA/DIA Secondary")
+    ever gets a look — silently starving it of new items run after run,
+    even though the pipeline reports success. Sorting candidates globally
+    by date fixes that: the newest email always wins regardless of which
+    folder it happens to live in.
+    """
     all_folders = get_folder_names(imap_conn)
     folder_names = [f for f in all_folders if not any(kw in f.lower() for kw in SKIP_FOLDER_KEYWORDS)]
     print(f"DEBUG: searching {len(folder_names)} folders (skipped {len(all_folders) - len(folder_names)} junk/trash/sent/etc.)")
 
+    candidates = []
+
     for folder in folder_names:
-        if len(emails) >= total_limit:
-            break
         try:
             status, _ = imap_conn.select(f'"{folder}"', readonly=True)
         except Exception:
@@ -323,38 +355,74 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
         message_nums = data[0].split()
         if not message_nums:
             continue
-        message_nums = list(reversed(message_nums))
 
         for num in message_nums:
-            if len(emails) >= total_limit:
-                break
-            status, msg_data = imap_conn.fetch(num, "(RFC822)")
-            if status != "OK":
+            status, header_data = imap_conn.fetch(
+                num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE)])"
+            )
+            if status != "OK" or not header_data or not header_data[0]:
                 continue
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            message_id = msg.get("Message-ID", f"no-id-{folder}-{num.decode()}")
+            raw_header = header_data[0][1]
+            if not raw_header:
+                continue
+            header_msg = email.message_from_bytes(raw_header)
+            message_id = header_msg.get("Message-ID", f"no-id-{folder}-{num.decode()}")
 
             if already_processed(db_conn, message_id):
                 continue
 
-            subject = decode_mime_words(msg.get("Subject", ""))
-            sender = decode_mime_words(msg.get("From", ""))
-            date_str = msg.get("Date", "")
+            subject = decode_mime_words(header_msg.get("Subject", ""))
+            sender = decode_mime_words(header_msg.get("From", ""))
+            date_str = header_msg.get("Date", "")
 
-            print(f"DEBUG: reading '{subject[:60]}' (extracting attachments/images/HTML)...")
-            body, attachment_text = get_email_body_and_attachments(msg)
-
-            emails.append({
+            candidates.append({
+                "folder": folder,
+                "num": num,
                 "message_id": message_id,
                 "subject": subject,
                 "sender": sender,
-                "date": date_str,
-                "body": body,
-                "attachment_text": attachment_text,
+                "date_str": date_str,
+                "date_parsed": parse_email_date(date_str),
             })
 
-    print(f"DEBUG: collected {len(emails)} new unprocessed emails to send to Gemini")
+    print(f"DEBUG: found {len(candidates)} unprocessed email(s) across all folders (before per-run limit)")
+
+    candidates.sort(key=lambda c: c["date_parsed"], reverse=True)
+    selected = candidates[:total_limit]
+
+    emails = []
+    current_folder = None
+    for cand in selected:
+        if cand["folder"] != current_folder:
+            try:
+                status, _ = imap_conn.select(f'"{cand["folder"]}"', readonly=True)
+            except Exception:
+                continue
+            if status != "OK":
+                continue
+            current_folder = cand["folder"]
+
+        status, msg_data = imap_conn.fetch(cand["num"], "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            continue
+        raw_email = msg_data[0][1]
+        if not raw_email:
+            continue
+        msg = email.message_from_bytes(raw_email)
+
+        print(f"DEBUG: reading '{cand['subject'][:60]}' from '{cand['folder']}' (extracting attachments/images/HTML)...")
+        body, attachment_text = get_email_body_and_attachments(msg)
+
+        emails.append({
+            "message_id": cand["message_id"],
+            "subject": cand["subject"],
+            "sender": cand["sender"],
+            "date": cand["date_str"],
+            "body": body,
+            "attachment_text": attachment_text,
+        })
+
+    print(f"DEBUG: collected {len(emails)} new unprocessed email(s) to send to Gemini (most recent first)")
     return emails
 
 
