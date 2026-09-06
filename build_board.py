@@ -178,10 +178,14 @@ const DATA = {data_json};
 const CATEGORY_COLORS = {{deadline:'#c0392b', event:'#1a7a6a', task:'#c98a1c', announcement:'#8a8a8e'}};
 const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items'}};
 
+// `stage` records which school stage each child is in (Primary = Years 1-6,
+// Secondary = Years 7-13 at DIA Emirates Hills). This lets the filter logic
+// correctly match stage-wide items (year_group "Primary"/"Secondary") to the
+// right child, instead of only matching exact year strings.
 const CHILDREN = [
   {{ id: 'All', label: 'All' }},
-  {{ id: 'Evelyn', label: 'Evelyn · Year 5', years: ['Year 5'] }},
-  {{ id: 'Milo', label: 'Milo · Year 8', years: ['Year 8'] }},
+  {{ id: 'Evelyn', label: 'Evelyn · Year 5', years: ['Year 5'], stage: 'Primary' }},
+  {{ id: 'Milo', label: 'Milo · Year 8', years: ['Year 8'], stage: 'Secondary' }},
 ];
 
 let activeTopic = 'All';
@@ -271,7 +275,15 @@ function matchesFilters(item) {{
   if (activeChild !== 'All') {{
     const child = CHILDREN.find(c => c.id === activeChild);
     const yg = item.year_group || '';
-    if (yg !== 'All' && !child.years.includes(yg)) return false;
+    if (yg === 'All') {{
+      // genuinely whole-school items always match
+    }} else if (yg === child.stage) {{
+      // stage-wide item (e.g. "Secondary") matches any child in that stage
+    }} else if (child.years.includes(yg)) {{
+      // exact year match (e.g. "Year 8")
+    }} else {{
+      return false;
+    }}
   }}
   return true;
 }}
@@ -303,6 +315,8 @@ function itemHtml(item) {{
 function renderList(containerId, items, passedFlag, setPassedFlag) {{
   const upcoming = items.filter(i => !isPast(i.date));
   const passed = items.filter(i => isPast(i.date));
+  upcoming.sort((a, b) => (a.date || '9999').localeCompare(b.date || '9999'));
+  passed.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
   let html = '';
   if (upcoming.length === 0 && passed.length === 0) {{
     html = '<div class="empty">Nothing here yet.</div>';
