@@ -40,7 +40,14 @@ TOTAL_EMAIL_LIMIT = 10
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
-YEAR_GROUPS = ["Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9", "Year 10", "Year 11", "Year 12", "Year 13", "All"]
+# Specific years, plus the two broader stage-wide tags, plus "All" for
+# genuinely whole-school items. Primary = Years 1-6, Secondary = Years 7-13
+# at DIA Emirates Hills.
+YEAR_GROUPS = [
+    "Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9",
+    "Year 10", "Year 11", "Year 12", "Year 13",
+    "Primary", "Secondary", "All",
+]
 TOPICS = ["Academic", "Admin", "CCAs", "Clinic", "Events", "PE", "Payments"]
 
 EXTRACTION_SYSTEM_PROMPT = f"""You extract actionable information from school emails for busy parents.
@@ -52,7 +59,14 @@ it has OCR noise/typos.
 
 For each email, identify:
 - Any deadlines, events, tasks, or announcements with a date attached
-- Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}; use "All" if it applies to the whole school or is unclear)
+- Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}).
+  - Use a specific year like "Year 8" when the email clearly names one year group.
+  - Use "Primary" when it applies broadly across Primary (Years 1-6) but not the whole school —
+    e.g. an email addressed to "Year 7-13" or "Secondary" should be tagged "Secondary", NOT "All".
+  - Use "Secondary" when it applies broadly across Secondary (Years 7-13) but not the whole school.
+  - Only use "All" when the email is genuinely whole-school, or you truly cannot tell which stage/year it targets.
+  - Do not default to "All" just because a range of years is mentioned — pick "Primary" or "Secondary" if the
+    range sits entirely within one stage.
 - Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)})
 - A short, clear summary a busy parent can scan in 5 seconds
 - If this item's date/time appears to CONTRADICT another item in this same batch (e.g. two emails give different
