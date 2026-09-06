@@ -158,6 +158,44 @@ def decode_mime_words(s):
     )
 
 
+def retag_legacy_all_items(conn):
+    """
+    One-time-ish cleanup pass: events saved to the DB before the Primary/Secondary
+    distinction existed may be tagged "All" when they were really stage-specific
+    (e.g. a "Secondary CCA" notice). Rather than requiring manual DB edits, use
+    simple, conservative keyword patterns on the source email's subject to correct
+    these -- DIA consistently prefixes Primary School emails with "PS" and
+    Secondary School emails with "SS" / "EH-SS", and often spells out ranges like
+    "Year 7-13". This only touches rows still tagged "All" and only reclassifies
+    when a pattern clearly matches, so it is safe to run on every pipeline run.
+    """
+    SECONDARY_PATTERNS = [
+        r"\bss\b", r"eh-ss", r"year\s*7\s*-\s*13", r"year\s*7\s*-\s*9",
+        r"year\s*10\s*-\s*11", r"year\s*12\s*-\s*13", r"\bsecondary\b",
+    ]
+    PRIMARY_PATTERNS = [
+        r"^ps\b", r"^ps\s*-", r"eh-ps", r"kg1\s*-\s*y6", r"\bprimary\b",
+    ]
+    sec_re = re.compile("|".join(SECONDARY_PATTERNS), re.IGNORECASE)
+    pri_re = re.compile("|".join(PRIMARY_PATTERNS), re.IGNORECASE)
+
+    rows = conn.execute("SELECT id, title, email_subject FROM events WHERE year_group = 'All'").fetchall()
+    updated = 0
+    for row_id, title, subject in rows:
+        text = f"{subject or ''} {title or ''}".strip()
+        new_tag = None
+        if sec_re.search(text):
+            new_tag = "Secondary"
+        elif pri_re.search(text):
+            new_tag = "Primary"
+        if new_tag:
+            conn.execute("UPDATE events SET year_group = ? WHERE id = ?", (new_tag, row_id))
+            updated += 1
+    conn.commit()
+    if updated:
+        print(f"DEBUG: retagged {updated} legacy 'All' item(s) to Primary/Secondary via subject-pattern heuristic")
+
+
 def parse_email_date(date_str):
     """Parse an RFC 2822 email Date header into an aware datetime for sorting.
     Falls back to the minimum possible datetime (so unparseable dates sort last,
@@ -509,6 +547,7 @@ def main():
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(MODEL)
     db_conn = init_db()
+    retag_legacy_all_items(db_conn)
 
     deleted = db_conn.execute("DELETE FROM events WHERE date IS NOT NULL AND date < '2025-01-01'").rowcount
     db_conn.commit()
