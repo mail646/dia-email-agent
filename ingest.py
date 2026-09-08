@@ -9,6 +9,7 @@ structured extraction, and stores results in SQLite.
 
 import imaplib
 import email
+import difflib
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 import sqlite3
@@ -30,7 +31,10 @@ ICLOUD_APP_PASSWORD = os.environ.get("ICLOUD_APP_PASSWORD", "xxxx-xxxx-xxxx-xxxx
 IMAP_SERVER = "imap.mail.me.com"
 IMAP_PORT = 993
 
-SCHOOL_DOMAIN = "diadubai.com"
+# List of sender domains to search for. Add more here if other systems (e.g.
+# Managebac, Toddle, Teams, iSAMS) send notification emails to your inbox from
+# their own domain -- each domain in this list gets searched in every folder.
+SCHOOL_DOMAINS = ["diadubai.com"]
 DB_PATH = os.environ.get("DIA_DB_PATH", os.path.join(os.path.dirname(__file__), "dia_events.db"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -48,17 +52,23 @@ YEAR_GROUPS = [
     "Year 10", "Year 11", "Year 12", "Year 13",
     "Primary", "Secondary", "All",
 ]
-TOPICS = ["Academic", "Admin", "CCAs", "Clinic", "Events", "PE", "Payments"]
+TOPICS = ["Academics", "School Info", "Activities"]
 
 EXTRACTION_SYSTEM_PROMPT = f"""You extract actionable information from school emails for busy parents.
 
 You will receive several emails, each marked with a line like "=== EMAIL 0 ===", "=== EMAIL 1 ===", etc.
+Each email's block includes its Date header -- use this to tell which of several emails is more recent.
 Some emails include text extracted from PDF/Word/Excel/PowerPoint attachments or OCR'd from images (photos of
 flyers, posters, forms) — treat this extracted text with the same importance as the email body itself, even if
 it has OCR noise/typos.
 
 For each email, identify:
-- Any deadlines, events, tasks, or announcements with a date attached
+- Any deadlines, events, tasks, tests/assignments, or announcements with a date attached.
+- Whole-school calendar items too: closures, holidays, early-dismissal days, etc. -- capture these as "event"
+  category items. IMPORTANT: if the SAME closure/dismissal has different dates or times for different stages
+  (e.g. Primary finishes at 11am but Secondary finishes at 12pm, or the stages break for a holiday on different
+  days), create SEPARATE items -- one per stage/year group -- each with its own correct date and year_group.
+  Do not collapse per-stage differences into a single item with just one date.
 - Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}).
   - Use a specific year like "Year 8" when the email clearly names one year group.
   - Use "Primary" when it applies broadly across Primary (Years 1-6) but not the whole school —
@@ -67,11 +77,18 @@ For each email, identify:
   - Only use "All" when the email is genuinely whole-school, or you truly cannot tell which stage/year it targets.
   - Do not default to "All" just because a range of years is mentioned — pick "Primary" or "Secondary" if the
     range sits entirely within one stage.
-- Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)})
-- A short, clear summary a busy parent can scan in 5 seconds
-- If this item's date/time appears to CONTRADICT another item in this same batch (e.g. two emails give different
-  deadlines for what looks like the same thing), add a short "conflict_note" explaining the discrepancy and which
-  one seems more authoritative. Otherwise leave conflict_note null. Do not force a conflict if unsure.
+- Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)}):
+  - "Academics": tests, exams, assignments/homework due, academic assessments (e.g. CAT4), report cards.
+  - "School Info": trips, parent meetings, parent rep sign-ups, clinic/health notices, payments, whole-school
+    closures/holidays/early dismissal, and general admin announcements.
+  - "Activities": CCA trials, sports trials, matches/fixtures, auditions, rehearsals, club sign-ups and start
+    dates.
+- A short, clear summary a busy parent can scan in 5 seconds.
+- CONFLICT RESOLUTION: if two or more emails in this batch describe what looks like the SAME deadline/event
+  (e.g. two emails both about "CCA registration") but give different dates/times, do NOT produce two separate
+  conflicting items. Instead produce ONE item using the date/details from whichever email has the MORE RECENT
+  Date header (the newest information wins), and set "conflict_note" to briefly explain that an earlier email
+  gave different information which this newer one supersedes.
 
 Respond ONLY with a single JSON array (no markdown fences, no preamble) combining items from ALL emails. Each item:
 {{
@@ -82,10 +99,11 @@ Respond ONLY with a single JSON array (no markdown fences, no preamble) combinin
   "year_group": "one of the allowed values above",
   "topic": "one of the allowed topic values above",
   "summary": "1-2 sentence summary of what the parent needs to know or do",
-  "conflict_note": "explanation if this conflicts with another item, else null"
+  "conflict_note": "explanation if this superseded an earlier conflicting mention, else null"
 }}
 
-The "email_index" field MUST match the number in that email's "=== EMAIL N ===" marker.
+The "email_index" field MUST match the number in that email's "=== EMAIL N ===" marker. If an item combines info
+from a NEWER email that supersedes an OLDER one in this same batch, use the email_index of the NEWER email.
 If an email has NO actionable dated information, simply produce no items for it.
 If an email covers multiple distinct items, produce multiple objects with the same email_index.
 """
@@ -158,16 +176,43 @@ def decode_mime_words(s):
     )
 
 
+def stage_from_year_mentions(text):
+    """
+    Scan free text for explicit "Year N" mentions (N = 4..13) and infer a stage:
+    DIA's boundary is Year 7 and above = Secondary, Year 6 and below = Primary.
+    Returns "Secondary" if every year number found is >= 7, "Primary" if every
+    one found is <= 6, or None if no year numbers were found or they span both
+    stages (in which case "All" may genuinely be correct, so we leave it alone).
+    """
+    nums = {int(n) for n in re.findall(r"year\s*([4-9]|1[0-3])\b", text, re.IGNORECASE)}
+    if not nums:
+        return None
+    if all(n >= 7 for n in nums):
+        return "Secondary"
+    if all(n <= 6 for n in nums):
+        return "Primary"
+    return None
+
+
 def retag_legacy_all_items(conn):
     """
     One-time-ish cleanup pass: events saved to the DB before the Primary/Secondary
     distinction existed may be tagged "All" when they were really stage-specific
-    (e.g. a "Secondary CCA" notice). Rather than requiring manual DB edits, use
-    simple, conservative keyword patterns on the source email's subject to correct
-    these -- DIA consistently prefixes Primary School emails with "PS" and
-    Secondary School emails with "SS" / "EH-SS", and often spells out ranges like
-    "Year 7-13". This only touches rows still tagged "All" and only reclassifies
-    when a pattern clearly matches, so it is safe to run on every pipeline run.
+    (e.g. a "Secondary CCA" notice). Rather than requiring manual DB edits, this
+    reclassifies them automatically using two layers of heuristics, checked in
+    order for each row still tagged "All":
+
+      1. Subject-line conventions -- DIA prefixes Primary School emails with "PS"
+         and Secondary School emails with "SS" / "EH-SS".
+      2. Explicit "Year N" mentions anywhere in the subject/title/summary -- DIA's
+         boundary is Year 7+ = Secondary, Year 6 and below = Primary (see
+         stage_from_year_mentions). This catches cases that don't follow the
+         PS/SS subject convention but still clearly name a stage-specific range
+         like "Year 7-13" or "Year 4-6".
+
+    Only rows that clearly match are changed; genuinely ambiguous or mixed-range
+    items are left as "All". Safe to run on every pipeline run since already-
+    corrected rows no longer match year_group = 'All'.
     """
     SECONDARY_PATTERNS = [
         r"\bss\b", r"eh-ss", r"year\s*7\s*-\s*13", r"year\s*7\s*-\s*9",
@@ -175,25 +220,28 @@ def retag_legacy_all_items(conn):
     ]
     PRIMARY_PATTERNS = [
         r"^ps\b", r"^ps\s*-", r"eh-ps", r"kg1\s*-\s*y6", r"\bprimary\b",
+        r"year\s*4\s*-\s*6", r"year\s*1\s*-\s*6",
     ]
     sec_re = re.compile("|".join(SECONDARY_PATTERNS), re.IGNORECASE)
     pri_re = re.compile("|".join(PRIMARY_PATTERNS), re.IGNORECASE)
 
-    rows = conn.execute("SELECT id, title, email_subject FROM events WHERE year_group = 'All'").fetchall()
+    rows = conn.execute("SELECT id, title, email_subject, summary FROM events WHERE year_group = 'All'").fetchall()
     updated = 0
-    for row_id, title, subject in rows:
-        text = f"{subject or ''} {title or ''}".strip()
+    for row_id, title, subject, summary in rows:
+        text = f"{subject or ''} {title or ''} {summary or ''}".strip()
         new_tag = None
         if sec_re.search(text):
             new_tag = "Secondary"
         elif pri_re.search(text):
             new_tag = "Primary"
+        else:
+            new_tag = stage_from_year_mentions(text)
         if new_tag:
             conn.execute("UPDATE events SET year_group = ? WHERE id = ?", (new_tag, row_id))
             updated += 1
     conn.commit()
     if updated:
-        print(f"DEBUG: retagged {updated} legacy 'All' item(s) to Primary/Secondary via subject-pattern heuristic")
+        print(f"DEBUG: retagged {updated} legacy 'All' item(s) to Primary/Secondary via heuristics")
 
 
 def parse_email_date(date_str):
@@ -242,17 +290,28 @@ def extract_attachment_text(part):
     content_type = part.get_content_type()
     try:
         if lower.endswith(".pdf") or content_type == "application/pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(payload))
+            import fitz  # PyMuPDF
             text_parts = []
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text_parts.append(page_text)
-                if not page_text.strip():
-                    for img_obj in getattr(page, "images", []):
-                        ocr_text = ocr_image_bytes(img_obj.data, filename)
-                        if ocr_text and not ocr_text.startswith("[Could not"):
-                            text_parts.append(f"[OCR from page image]\n{ocr_text}")
+            doc = fitz.open(stream=payload, filetype="pdf")
+            for page_num, page in enumerate(doc):
+                page_text = (page.get_text() or "").strip()
+                if page_text:
+                    text_parts.append(page_text)
+                # Always OCR a full render of the page too, not just pages with
+                # zero selectable text. Stylized flyers routinely mix plain
+                # selectable text (e.g. a footer) with graphic/text-as-image
+                # content (e.g. a colorful title or a dates box baked into
+                # artwork) on the SAME page -- checking only pages with no
+                # selectable text at all would silently miss the graphic parts
+                # of pages that have some plain text elsewhere on them.
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for OCR quality
+                    ocr_text = ocr_image_bytes(pix.tobytes("png"), f"{filename} page {page_num + 1}")
+                    if ocr_text and not ocr_text.startswith("[Could not"):
+                        text_parts.append(f"[OCR from page {page_num + 1}]\n{ocr_text}")
+                except Exception as e:
+                    text_parts.append(f"[Could not OCR page {page_num + 1}: {e}]")
+            doc.close()
             return "\n".join(text_parts)
 
         elif lower.endswith(".docx") or "wordprocessingml.document" in content_type:
@@ -399,14 +458,15 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
         if status != "OK":
             continue
 
-        search_query = f'(FROM "{SCHOOL_DOMAIN}" SINCE "01-Jan-2025")'
-        status, data = imap_conn.search(None, search_query)
-        if status != "OK" or not data or data[0] is None:
+        message_nums_set = set()
+        for domain in SCHOOL_DOMAINS:
+            search_query = f'(FROM "{domain}" SINCE "01-Jan-2025")'
+            status, data = imap_conn.search(None, search_query)
+            if status == "OK" and data and data[0]:
+                message_nums_set.update(data[0].split())
+        if not message_nums_set:
             continue
-
-        message_nums = data[0].split()
-        if not message_nums:
-            continue
+        message_nums = list(message_nums_set)
 
         for num in message_nums:
             status, header_data = imap_conn.fetch(
@@ -476,6 +536,65 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
 
     print(f"DEBUG: collected {len(emails)} new unprocessed email(s) to send to Gemini (most recent first)")
     return emails
+
+
+def dedupe_similar_events(conn):
+    """
+    Removes duplicate/superseded events that build up over time when the same
+    recurring item (e.g. "CCA sign-ups begin") gets mentioned across several
+    separate emails on different days. Groups events that share the same
+    category and year_group and have a highly similar title (using Python's
+    built-in difflib, no extra dependency needed), and within each group keeps
+    only the one tied to the most recent underlying email, deleting the rest.
+    Runs over the whole table every run, so it cleans up both pre-existing and
+    newly-added duplicates alike.
+    """
+    rows = conn.execute(
+        "SELECT id, title, category, year_group, email_date, created_at FROM events"
+    ).fetchall()
+
+    def sort_key(row):
+        _, _, _, _, email_date, created_at = row
+        dt = parse_email_date(email_date)
+        if dt == datetime.min.replace(tzinfo=timezone.utc) and created_at:
+            try:
+                return datetime.fromisoformat(created_at)
+            except Exception:
+                pass
+        return dt
+
+    used = set()
+    to_delete = []
+    n = len(rows)
+    for i in range(n):
+        id_i = rows[i][0]
+        if id_i in used:
+            continue
+        title_i, cat_i, yg_i = (rows[i][1] or ""), rows[i][2], rows[i][3]
+        group = [rows[i]]
+        for j in range(i + 1, n):
+            id_j = rows[j][0]
+            if id_j in used:
+                continue
+            title_j, cat_j, yg_j = (rows[j][1] or ""), rows[j][2], rows[j][3]
+            if cat_j != cat_i or yg_j != yg_i:
+                continue
+            ratio = difflib.SequenceMatcher(None, title_i.lower().strip(), title_j.lower().strip()).ratio()
+            if ratio >= 0.72:
+                group.append(rows[j])
+        if len(group) > 1:
+            group_sorted = sorted(group, key=sort_key, reverse=True)
+            for row in group_sorted[1:]:
+                to_delete.append(row[0])
+            for row in group:
+                used.add(row[0])
+        else:
+            used.add(id_i)
+
+    if to_delete:
+        conn.executemany("DELETE FROM events WHERE id = ?", [(rid,) for rid in to_delete])
+        conn.commit()
+        print(f"DEBUG: removed {len(to_delete)} duplicate/superseded event(s) (kept most recent per group)")
 
 
 def extract_events_batch(model, emails_batch, max_retries=3):
@@ -556,7 +675,7 @@ def main():
     print("Connecting to iCloud Mail...")
     imap_conn = imap_connect()
 
-    print(f"Fetching emails from {SCHOOL_DOMAIN}...")
+    print(f"Fetching emails from: {', '.join(SCHOOL_DOMAINS)}...")
     emails = fetch_new_school_emails(imap_conn, db_conn)
 
     if not emails:
@@ -581,6 +700,8 @@ def main():
                 else:
                     print(f"  -> '{email_data['subject'][:50]}': no actionable items")
                 mark_processed(db_conn, email_data["message_id"])
+
+    dedupe_similar_events(db_conn)
 
     print("\nDone.")
     imap_conn.logout()
