@@ -145,16 +145,33 @@ def build_html(rows):
     font-size: 0.64em; border-radius: 4px; padding: 2px 4px; margin-top: 3px; color: #fff;
     overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   }}
+  .item {{ cursor: pointer; }}
+  .source-overlay {{
+    position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 50;
+  }}
+  .source-overlay.show {{ display: flex; }}
+  .source-card {{
+    background: var(--card); border-radius: 14px; padding: 20px 22px; max-width: 420px;
+    width: 100%; box-shadow: var(--shadow);
+  }}
+  .source-title {{
+    font-family: 'Source Serif 4', Georgia, serif; font-weight: 700; font-size: 1.1em; margin-bottom: 12px;
+  }}
+  .source-row {{ font-size: 0.87em; margin-bottom: 7px; color: #444; word-break: break-word; }}
+  .source-row strong {{ color: var(--ink); }}
+  .source-hint {{ font-size: 0.8em; color: var(--muted); margin: 12px 0 16px; line-height: 1.4; }}
+  .source-btn {{
+    width: 100%; padding: 11px; border-radius: 9px; border: none; background: var(--accent);
+    color: #fff; font-size: 0.87em; font-weight: 600; margin-bottom: 8px; cursor: pointer;
+    font-family: inherit;
+  }}
+  .source-btn-close {{ background: var(--card); color: var(--ink); border: 1px solid var(--line); }}
 </style>
 </head>
 <body>
   <h1>DIA Emirates Hills</h1>
   <div class="sub">Parent Board · Last updated {updated}</div>
-  <div class="disclaimer">
-    An unofficial digest kept by a parent. Every entry is summarised from an email the school sent; nothing here
-    is written or endorsed by the school. Dates are copied as the school wrote them — check the original email
-    before acting on anything.
-  </div>
 
   <div class="toolbar" id="childChips"></div>
   <input type="text" id="search" placeholder="Search titles, summaries..." oninput="render()">
@@ -172,6 +189,18 @@ def build_html(rows):
   <div class="view" id="view-events"></div>
   <div class="view" id="view-calendar"></div>
   <div class="view" id="view-summaries"></div>
+
+  <div class="source-overlay" id="sourceOverlay" onclick="if(event.target===this) closeSource()">
+    <div class="source-card">
+      <div class="source-title" id="srcTitle">Source</div>
+      <div class="source-row"><strong>From:</strong> <span id="srcSender"></span></div>
+      <div class="source-row"><strong>Subject:</strong> <span id="srcSubject"></span></div>
+      <div class="source-row"><strong>Date:</strong> <span id="srcDate"></span></div>
+      <div class="source-hint" id="srcHint"></div>
+      <button class="source-btn" onclick="copySourceSubject()">Copy subject to search Mail</button>
+      <button class="source-btn source-btn-close" onclick="closeSource()">Close</button>
+    </div>
+  </div>
 
 <script>
 const DATA = {data_json};
@@ -294,7 +323,7 @@ function itemHtml(item) {{
   const relCls = past ? 'muted' : urgencyClass(item.date);
   const barColor = past ? 'var(--line)' : urgencyColor(item.date);
   const conflict = item.conflict_note ? `<div class="item-conflict">⚠ ${{item.conflict_note}}</div>` : '';
-  return `<div class="item ${{past ? 'past' : ''}}">
+  return `<div class="item ${{past ? 'past' : ''}}" onclick="showSource(${{item.id}})">
     <div class="urgency-bar" style="background:${{barColor}}"></div>
     <div class="item-body">
       <div class="rel ${{relCls}}">${{rel}}</div>
@@ -330,6 +359,48 @@ function renderList(containerId, items, passedFlag, setPassedFlag) {{
     }}
   }}
   document.getElementById(containerId).innerHTML = html;
+}}
+
+function showSource(id) {{
+  const item = DATA.find(d => Number(d.id) === Number(id));
+  if (!item) return;
+  const sender = item.email_sender || '(unknown sender)';
+  const subject = item.email_subject || '(no subject)';
+  const dateStr = item.email_date || '';
+
+  document.getElementById('srcTitle').textContent = item.title || 'Source';
+  document.getElementById('srcSender').textContent = sender;
+  document.getElementById('srcSubject').textContent = subject;
+  document.getElementById('srcDate').textContent = dateStr;
+
+  const domainMatch = sender.match(/@([\\w.-]+)/);
+  const domain = domainMatch ? domainMatch[1].toLowerCase() : '';
+  let hint;
+  if (domain && domain !== 'diadubai.com') {{
+    hint = `This came from ${{domain}}, not a direct school email — check that app/platform for the original message.`;
+  }} else {{
+    hint = `iCloud Mail doesn't support jumping straight to one email from here. Tap "Copy subject" below, then paste it into Mail's search bar to find the original.`;
+  }}
+  document.getElementById('srcHint').textContent = hint;
+  window.__lastSourceSubject = subject;
+  document.getElementById('sourceOverlay').classList.add('show');
+}}
+
+function closeSource() {{
+  document.getElementById('sourceOverlay').classList.remove('show');
+}}
+
+function copySourceSubject() {{
+  const text = window.__lastSourceSubject || '';
+  if (navigator.clipboard && text) {{
+    navigator.clipboard.writeText(text).then(() => {{
+      alert('Copied: ' + text);
+    }}).catch(() => {{
+      alert('Subject: ' + text);
+    }});
+  }} else {{
+    alert('Subject: ' + text);
+  }}
 }}
 
 function toggleDeadlinesPassed() {{ showPassedDeadlines = !showPassedDeadlines; render(); }}
