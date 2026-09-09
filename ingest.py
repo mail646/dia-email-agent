@@ -40,7 +40,7 @@ DB_PATH = os.environ.get("DIA_DB_PATH", os.path.join(os.path.dirname(__file__), 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
 
-TOTAL_EMAIL_LIMIT = 10
+TOTAL_EMAIL_LIMIT = 30
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
@@ -78,9 +78,11 @@ For each email, identify:
   - Do not default to "All" just because a range of years is mentioned — pick "Primary" or "Secondary" if the
     range sits entirely within one stage.
 - Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)}):
-  - "Academics": tests, exams, assignments/homework due, academic assessments (e.g. CAT4), report cards.
-  - "School Info": trips, parent meetings, parent rep sign-ups, clinic/health notices, payments, whole-school
-    closures/holidays/early dismissal, and general admin announcements.
+  - "Academics": tests, exams, assignments/homework due, academic assessments (e.g. CAT4), and the release of
+    report cards, exam results, or parent reports.
+  - "School Info": trips, parent meetings and information sessions the school is inviting parents to (parent-
+    teacher conferences, coffee mornings, orientation/welcome sessions), parent rep sign-ups, clinic/health
+    notices, payments, whole-school closures/holidays/early dismissal, and general admin announcements.
   - "Activities": CCA trials, sports trials, matches/fixtures, auditions, rehearsals, club sign-ups and start
     dates.
 - A short, clear summary a busy parent can scan in 5 seconds.
@@ -281,6 +283,96 @@ def ocr_image_bytes(payload, filename=""):
         return f"[Could not OCR {filename}: {e}]"
 
 
+def extract_pdf_bytes_text(payload, label=""):
+    """
+    Renders every page of a PDF (given as raw bytes) to a full-page image and OCRs
+    it, in addition to pulling any plain selectable text, regardless of whether the
+    page also has some plain text elsewhere on it. Shared by both email attachments
+    and PDFs found at links inside an email body.
+    """
+    import fitz  # PyMuPDF
+    text_parts = []
+    try:
+        doc = fitz.open(stream=payload, filetype="pdf")
+        for page_num, page in enumerate(doc):
+            page_text = (page.get_text() or "").strip()
+            if page_text:
+                text_parts.append(page_text)
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for OCR quality
+                ocr_text = ocr_image_bytes(pix.tobytes("png"), f"{label} page {page_num + 1}")
+                if ocr_text and not ocr_text.startswith("[Could not"):
+                    text_parts.append(f"[OCR from page {page_num + 1}]\n{ocr_text}")
+            except Exception as e:
+                text_parts.append(f"[Could not OCR page {page_num + 1}: {e}]")
+        doc.close()
+    except Exception as e:
+        return f"[Could not extract PDF {label}: {e}]"
+    return "\n".join(text_parts)
+
+
+LINK_SKIP_PATTERNS = [
+    "unsubscribe", "mailto:", "facebook.com", "twitter.com", "x.com", "instagram.com",
+    "linkedin.com", "youtube.com", "tiktok.com",
+]
+MAX_LINKS_PER_EMAIL = 4
+MAX_LINK_BYTES = 8 * 1024 * 1024  # 8 MB safety cap
+
+
+def extract_links_from_text(html_body, plain_body):
+    """Pulls http(s) links out of an email's HTML/plain body, filtering out
+    obvious non-content links (unsubscribe, social media, etc.), capped to a
+    small number per email to bound fetch time/cost."""
+    urls = set()
+    for text in (html_body or "", plain_body or ""):
+        for match in re.findall(r'href=["\']((?:https?:)?//[^"\']+)["\']', text, re.IGNORECASE):
+            urls.add(match if match.startswith("http") else "https:" + match)
+        for match in re.findall(r'(https?://[^\s<>"\')]+)', text):
+            urls.add(match.rstrip('.,);'))
+    filtered = []
+    for u in urls:
+        low = u.lower()
+        if any(p in low for p in LINK_SKIP_PATTERNS):
+            continue
+        filtered.append(u)
+    return filtered[:MAX_LINKS_PER_EMAIL]
+
+
+def fetch_linked_content_text(urls):
+    """
+    Follows a small number of links found in an email body and pulls text from
+    what they point to -- some school newsletters put the actual content on a
+    linked page or hosted PDF rather than in the email itself. HTML pages are
+    extracted as plain text; PDFs go through the same full-page OCR pipeline as
+    attachments.
+
+    NOTE: pages that render their content via JavaScript (some newsletter
+    platforms do) may come back mostly blank here, since this does a plain
+    HTTP fetch rather than running a real browser. That's a known gap, not a
+    bug, if a link like that comes back empty -- a real fix would need a
+    headless-browser fetch instead.
+    """
+    import requests
+    blocks = []
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200 or len(resp.content) > MAX_LINK_BYTES:
+                continue
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "pdf" in content_type or url.lower().endswith(".pdf"):
+                text = extract_pdf_bytes_text(resp.content, url)
+            elif "html" in content_type or not content_type:
+                text = html_to_text(resp.text)
+            else:
+                continue
+            if text and text.strip():
+                blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
+        except Exception as e:
+            blocks.append(f"[Could not fetch linked content {url}: {e}]")
+    return "\n\n".join(blocks)
+
+
 def extract_attachment_text(part):
     filename = part.get_filename() or ""
     payload = part.get_payload(decode=True)
@@ -290,29 +382,7 @@ def extract_attachment_text(part):
     content_type = part.get_content_type()
     try:
         if lower.endswith(".pdf") or content_type == "application/pdf":
-            import fitz  # PyMuPDF
-            text_parts = []
-            doc = fitz.open(stream=payload, filetype="pdf")
-            for page_num, page in enumerate(doc):
-                page_text = (page.get_text() or "").strip()
-                if page_text:
-                    text_parts.append(page_text)
-                # Always OCR a full render of the page too, not just pages with
-                # zero selectable text. Stylized flyers routinely mix plain
-                # selectable text (e.g. a footer) with graphic/text-as-image
-                # content (e.g. a colorful title or a dates box baked into
-                # artwork) on the SAME page -- checking only pages with no
-                # selectable text at all would silently miss the graphic parts
-                # of pages that have some plain text elsewhere on them.
-                try:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for OCR quality
-                    ocr_text = ocr_image_bytes(pix.tobytes("png"), f"{filename} page {page_num + 1}")
-                    if ocr_text and not ocr_text.startswith("[Could not"):
-                        text_parts.append(f"[OCR from page {page_num + 1}]\n{ocr_text}")
-                except Exception as e:
-                    text_parts.append(f"[Could not OCR page {page_num + 1}: {e}]")
-            doc.close()
-            return "\n".join(text_parts)
+            return extract_pdf_bytes_text(payload, filename)
 
         elif lower.endswith(".docx") or "wordprocessingml.document" in content_type:
             import docx
@@ -406,6 +476,12 @@ def get_email_body_and_attachments(msg):
     body = plain_body.strip()
     if not body and html_body:
         body = html_to_text(html_body)
+
+    link_urls = extract_links_from_text(html_body, plain_body)
+    if link_urls:
+        linked_text = fetch_linked_content_text(link_urls)
+        if linked_text.strip():
+            attachment_text_blocks.append(linked_text)
 
     return body, "\n\n".join(attachment_text_blocks)
 
@@ -597,6 +673,31 @@ def dedupe_similar_events(conn):
         print(f"DEBUG: removed {len(to_delete)} duplicate/superseded event(s) (kept most recent per group)")
 
 
+def retag_legacy_topics(conn):
+    """
+    Maps the old 7-value topic taxonomy (Academic/Admin/CCAs/Clinic/Events/PE/Payments)
+    used before the simplified Academics/School Info/Activities system onto the new
+    values, so old rows don't keep showing stale topic chips on the board. This is a
+    straightforward 1:1 lookup (not a heuristic guess), so it's safe to run every time.
+    """
+    TOPIC_MIGRATION = {
+        "Academic": "Academics",
+        "Admin": "School Info",
+        "Events": "School Info",
+        "Clinic": "School Info",
+        "Payments": "School Info",
+        "CCAs": "Activities",
+        "PE": "Activities",
+    }
+    updated = 0
+    for old, new in TOPIC_MIGRATION.items():
+        cur = conn.execute("UPDATE events SET topic = ? WHERE topic = ?", (new, old))
+        updated += cur.rowcount
+    if updated:
+        conn.commit()
+        print(f"DEBUG: migrated {updated} event(s) from the old topic taxonomy to Academics/School Info/Activities")
+
+
 def extract_events_batch(model, emails_batch, max_retries=3):
     combined = ""
     for i, ed in enumerate(emails_batch):
@@ -667,6 +768,7 @@ def main():
     model = genai.GenerativeModel(MODEL)
     db_conn = init_db()
     retag_legacy_all_items(db_conn)
+    retag_legacy_topics(db_conn)
 
     deleted = db_conn.execute("DELETE FROM events WHERE date IS NOT NULL AND date < '2025-01-01'").rowcount
     db_conn.commit()
