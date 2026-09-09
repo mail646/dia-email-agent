@@ -207,6 +207,27 @@ const DATA = {data_json};
 const CATEGORY_COLORS = {{deadline:'#c0392b', event:'#1a7a6a', task:'#c98a1c', announcement:'#8a8a8e'}};
 const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items'}};
 
+// Maps the old 7-value topic taxonomy onto the current 3-category system, so
+// the board only ever shows Academics/School Info/Activities chips even if
+// some rows in the underlying data still carry an old tag (e.g. from before
+// a migration ran, or a stray extraction). This keeps the UI simple
+// regardless of what's sitting in the data.
+const TOPIC_ALIASES = {{
+  'Academic': 'Academics',
+  'Admin': 'School Info',
+  'Events': 'School Info',
+  'Clinic': 'School Info',
+  'Payments': 'School Info',
+  'CCAs': 'Activities',
+  'PE': 'Activities',
+}};
+const CANONICAL_TOPICS = ['Academics', 'School Info', 'Activities'];
+
+function normalizeTopic(topic) {{
+  if (!topic) return 'School Info';
+  return TOPIC_ALIASES[topic] || topic;
+}}
+
 // `stage` records which school stage each child is in (Primary = Years 1-6,
 // Secondary = Years 7-13 at DIA Emirates Hills). This lets the filter logic
 // correctly match stage-wide items (year_group "Primary"/"Secondary") to the
@@ -300,7 +321,7 @@ function matchesFilters(item) {{
     const haystack = `${{item.title}} ${{item.summary}} ${{item.year_group}}`.toLowerCase();
     if (!fuzzyIncludes(haystack, q)) return false;
   }}
-  if (activeTopic !== 'All' && item.topic !== activeTopic) return false;
+  if (activeTopic !== 'All' && normalizeTopic(item.topic) !== activeTopic) return false;
   if (activeChild !== 'All') {{
     const child = CHILDREN.find(c => c.id === activeChild);
     const yg = item.year_group || '';
@@ -333,7 +354,7 @@ function itemHtml(item) {{
         ${{conflict}}
         <div class="item-meta">
           <span class="tag">${{item.year_group || 'All'}}</span>
-          ${{item.topic ? `<span class="tag">${{item.topic}}</span>` : ''}}
+          ${{item.topic ? `<span class="tag">${{normalizeTopic(item.topic)}}</span>` : ''}}
           from "${{item.email_subject || ''}}"
         </div>
       </div>
@@ -470,7 +491,7 @@ function render() {{
 }}
 
 function buildTopicChips() {{
-  const topics = ['All', ...new Set(DATA.map(i => i.topic).filter(Boolean))];
+  const topics = ['All', ...CANONICAL_TOPICS];
   document.getElementById('topicChips').innerHTML = topics.map(t =>
     `<div class="chip ${{t === activeTopic ? 'active' : ''}}" onclick="setTopic('${{t}}')">${{t}}</div>`
   ).join('');
