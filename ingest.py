@@ -41,6 +41,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
 
 TOTAL_EMAIL_LIMIT = 30
+GEMINI_CHUNK_SIZE = 10  # emails per Gemini call; keeps calls small enough to avoid rate limits
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
@@ -851,25 +852,37 @@ def main():
     if not emails:
         print("No new emails to process.")
     else:
-        print(f"Sending {len(emails)} email(s) to Gemini in a single batch call...")
-        all_items = extract_events_batch(model, emails)
+        # Send Gemini calls in smaller chunks rather than one giant batch. A
+        # single oversized call is more likely to hit rate limits, and if it
+        # fails after retries, EVERYTHING in it is lost -- not just some of
+        # it. Chunking means a failure only costs that chunk's emails, which
+        # simply stay unprocessed for next run instead of the whole batch.
+        chunks = [emails[i:i + GEMINI_CHUNK_SIZE] for i in range(0, len(emails), GEMINI_CHUNK_SIZE)]
+        print(f"Sending {len(emails)} email(s) to Gemini in {len(chunks)} batch(es) of up to {GEMINI_CHUNK_SIZE}...")
 
-        if all_items is None:
-            print("Batch call failed after retries — leaving these emails unprocessed for next run.")
-        else:
-            by_index = {}
-            for item in all_items:
-                idx = item.get("email_index")
-                by_index.setdefault(idx, []).append(item)
+        for chunk_index, chunk in enumerate(chunks):
+            print(f"--- Batch {chunk_index + 1}/{len(chunks)} ({len(chunk)} email(s)) ---")
+            all_items = extract_events_batch(model, chunk)
 
-            for i, email_data in enumerate(emails):
-                items = by_index.get(i, [])
-                if items:
-                    save_events(db_conn, email_data, items)
-                    print(f"  -> '{email_data['subject'][:50]}': extracted {len(items)} item(s)")
-                else:
-                    print(f"  -> '{email_data['subject'][:50]}': no actionable items")
-                mark_processed(db_conn, email_data["message_id"], email_data.get("subject"))
+            if all_items is None:
+                print("Batch call failed after retries — leaving these emails unprocessed for next run.")
+            else:
+                by_index = {}
+                for item in all_items:
+                    idx = item.get("email_index")
+                    by_index.setdefault(idx, []).append(item)
+
+                for i, email_data in enumerate(chunk):
+                    items = by_index.get(i, [])
+                    if items:
+                        save_events(db_conn, email_data, items)
+                        print(f"  -> '{email_data['subject'][:50]}': extracted {len(items)} item(s)")
+                    else:
+                        print(f"  -> '{email_data['subject'][:50]}': no actionable items")
+                    mark_processed(db_conn, email_data["message_id"], email_data.get("subject"))
+
+            if chunk_index < len(chunks) - 1:
+                time.sleep(5)  # brief pause between batches to ease rate-limit pressure
 
     dedupe_similar_events(db_conn)
 
