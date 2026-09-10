@@ -765,6 +765,7 @@ def extract_events_batch(model, emails_batch, max_retries=3):
         combined += f"\n=== EMAIL {i} ===\nSubject: {ed['subject']}\nFrom: {ed['sender']}\nDate: {ed['date']}\n\nBody:\n{ed['body']}\n\n{ed['attachment_text']}\n"
 
     response = None
+    last_error = None
     for attempt in range(max_retries):
         try:
             response = model.generate_content(
@@ -773,16 +774,17 @@ def extract_events_batch(model, emails_batch, max_retries=3):
             )
             break
         except Exception as e:
+            last_error = e
             if "429" in str(e) or "quota" in str(e).lower():
                 wait = 30 * (attempt + 1)
-                print(f"WARNING: rate limited, waiting {wait}s before retry...")
+                print(f"WARNING: rate limited, waiting {wait}s before retry... (error: {e})")
                 time.sleep(wait)
                 continue
             else:
                 print(f"WARNING: Gemini call failed: {e}")
                 return None
     else:
-        print("WARNING: gave up after retries due to rate limiting")
+        print(f"WARNING: gave up after retries due to rate limiting. Last error: {last_error}")
         return None
 
     if response is None:
