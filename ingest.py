@@ -144,6 +144,12 @@ def init_db():
             processed_at TEXT
         )
     """)
+    existing_processed_cols = {row[1] for row in conn.execute("PRAGMA table_info(processed_messages)")}
+    if "subject" not in existing_processed_cols:
+        try:
+            conn.execute("ALTER TABLE processed_messages ADD COLUMN subject TEXT")
+        except sqlite3.OperationalError:
+            pass
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
     for col in ["topic", "conflict_note"]:
         if col not in existing_cols:
@@ -160,10 +166,10 @@ def already_processed(conn, message_id):
     return cur.fetchone() is not None
 
 
-def mark_processed(conn, message_id):
+def mark_processed(conn, message_id, subject=None):
     conn.execute(
-        "INSERT OR IGNORE INTO processed_messages (message_id, processed_at) VALUES (?, ?)",
-        (message_id, datetime.now(timezone.utc).isoformat()),
+        "INSERT OR IGNORE INTO processed_messages (message_id, processed_at, subject) VALUES (?, ?, ?)",
+        (message_id, datetime.now(timezone.utc).isoformat(), subject),
     )
     conn.commit()
 
@@ -614,6 +620,53 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
     return emails
 
 
+def full_reprocess_wipe(conn):
+    """
+    Wipes the entire processed-messages history and all extracted events, so
+    the next fetch treats every single email since Jan 2025 as brand new and
+    re-runs it through whatever the current extraction logic is. Useful after
+    a meaningful pipeline improvement (e.g. full-page OCR, link-following),
+    since emails processed under an older, buggier version are otherwise
+    permanently stuck with incomplete results -- this forces a clean slate.
+    """
+    conn.execute("DELETE FROM events")
+    conn.execute("DELETE FROM processed_messages")
+    conn.commit()
+    print("DEBUG: FULL REPROCESS requested -- wiped all events and processed-message history")
+
+
+def force_reprocess_by_keyword(conn, keyword):
+    """
+    Lets a specific past email be re-processed under the current (improved)
+    extraction logic, for cases where an email was marked "processed" before a
+    fix (e.g. full-page OCR) existed, and so is permanently stuck with its old,
+    incomplete results. Matches against both the events table's email_subject
+    (works for any email that already produced at least one event) and
+    processed_messages' subject column (works even for emails that previously
+    produced zero events, as long as they were processed after this column was
+    added). Clears the matching message(s) from processed_messages and deletes
+    their existing events, so the next fetch treats them as brand new.
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return
+    like = f"%{keyword}%"
+    ids_from_events = conn.execute(
+        "SELECT DISTINCT source_message_id FROM events WHERE email_subject LIKE ?", (like,)
+    ).fetchall()
+    ids_from_processed = conn.execute(
+        "SELECT DISTINCT message_id FROM processed_messages WHERE subject LIKE ?", (like,)
+    ).fetchall()
+    message_ids = {row[0] for row in (ids_from_events + ids_from_processed) if row[0]}
+    if not message_ids:
+        print(f"DEBUG: force-reprocess keyword '{keyword}' matched no known message subject")
+        return
+    conn.executemany("DELETE FROM processed_messages WHERE message_id = ?", [(m,) for m in message_ids])
+    conn.executemany("DELETE FROM events WHERE source_message_id = ?", [(m,) for m in message_ids])
+    conn.commit()
+    print(f"DEBUG: cleared {len(message_ids)} message(s) matching '{keyword}' for reprocessing")
+
+
 def dedupe_similar_events(conn):
     """
     Removes duplicate/superseded events that build up over time when the same
@@ -767,8 +820,23 @@ def main():
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(MODEL)
     db_conn = init_db()
+
+    full_reprocess = os.environ.get("FULL_REPROCESS", "").strip().lower() in ("true", "1", "yes")
+    if full_reprocess:
+        full_reprocess_wipe(db_conn)
+
     retag_legacy_all_items(db_conn)
     retag_legacy_topics(db_conn)
+
+    force_reprocess_keyword = os.environ.get("FORCE_REPROCESS_KEYWORD", "").strip()
+    if force_reprocess_keyword:
+        force_reprocess_by_keyword(db_conn, force_reprocess_keyword)
+
+    email_limit = TOTAL_EMAIL_LIMIT
+    limit_override = os.environ.get("EMAIL_LIMIT_OVERRIDE", "").strip()
+    if limit_override.isdigit():
+        email_limit = int(limit_override)
+        print(f"DEBUG: per-run email limit overridden to {email_limit} (default is {TOTAL_EMAIL_LIMIT})")
 
     deleted = db_conn.execute("DELETE FROM events WHERE date IS NOT NULL AND date < '2025-01-01'").rowcount
     db_conn.commit()
@@ -778,7 +846,7 @@ def main():
     imap_conn = imap_connect()
 
     print(f"Fetching emails from: {', '.join(SCHOOL_DOMAINS)}...")
-    emails = fetch_new_school_emails(imap_conn, db_conn)
+    emails = fetch_new_school_emails(imap_conn, db_conn, total_limit=email_limit)
 
     if not emails:
         print("No new emails to process.")
@@ -801,7 +869,7 @@ def main():
                     print(f"  -> '{email_data['subject'][:50]}': extracted {len(items)} item(s)")
                 else:
                     print(f"  -> '{email_data['subject'][:50]}': no actionable items")
-                mark_processed(db_conn, email_data["message_id"])
+                mark_processed(db_conn, email_data["message_id"], email_data.get("subject"))
 
     dedupe_similar_events(db_conn)
 
