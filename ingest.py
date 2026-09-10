@@ -670,21 +670,23 @@ def force_reprocess_by_keyword(conn, keyword):
 
 def dedupe_similar_events(conn):
     """
-    Removes duplicate/superseded events that build up over time when the same
-    recurring item (e.g. "CCA sign-ups begin") gets mentioned across several
-    separate emails on different days. Groups events that share the same
-    category and year_group and have a highly similar title (using Python's
-    built-in difflib, no extra dependency needed), and within each group keeps
-    only the one tied to the most recent underlying email, deleting the rest.
-    Runs over the whole table every run, so it cleans up both pre-existing and
-    newly-added duplicates alike.
+    Removes duplicate/superseded events that build up when the same recurring
+    item (e.g. "CCA sign-ups begin") gets mentioned across multiple separate
+    emails over time. Two events are only ever considered possible duplicates
+    if they share the same category, year_group, AND date (dates must match --
+    two different activities that happen to use similar generic wording, like
+    "CCA Sign-Up" for two different clubs, must NOT be merged just because the
+    wording is similar; a real duplicate of the same event will also share the
+    same date). On top of that, titles must be a very close textual match
+    (>= 0.85 similarity). Within each matched group, keeps only the one tied
+    to the most recent underlying email, deleting the rest.
     """
     rows = conn.execute(
-        "SELECT id, title, category, year_group, email_date, created_at FROM events"
+        "SELECT id, title, category, year_group, date, email_date, created_at FROM events"
     ).fetchall()
 
     def sort_key(row):
-        _, _, _, _, email_date, created_at = row
+        _, _, _, _, _, email_date, created_at = row
         dt = parse_email_date(email_date)
         if dt == datetime.min.replace(tzinfo=timezone.utc) and created_at:
             try:
@@ -700,17 +702,22 @@ def dedupe_similar_events(conn):
         id_i = rows[i][0]
         if id_i in used:
             continue
-        title_i, cat_i, yg_i = (rows[i][1] or ""), rows[i][2], rows[i][3]
+        title_i, cat_i, yg_i, date_i = (rows[i][1] or ""), rows[i][2], rows[i][3], rows[i][4]
         group = [rows[i]]
         for j in range(i + 1, n):
             id_j = rows[j][0]
             if id_j in used:
                 continue
-            title_j, cat_j, yg_j = (rows[j][1] or ""), rows[j][2], rows[j][3]
+            title_j, cat_j, yg_j, date_j = (rows[j][1] or ""), rows[j][2], rows[j][3], rows[j][4]
             if cat_j != cat_i or yg_j != yg_i:
                 continue
+            # Dates must match too -- this is the key guard against merging
+            # genuinely different events that just happen to share generic
+            # wording ("CCA Sign-Up" for two different clubs, for example).
+            if date_i != date_j:
+                continue
             ratio = difflib.SequenceMatcher(None, title_i.lower().strip(), title_j.lower().strip()).ratio()
-            if ratio >= 0.72:
+            if ratio >= 0.85:
                 group.append(rows[j])
         if len(group) > 1:
             group_sorted = sorted(group, key=sort_key, reverse=True)
