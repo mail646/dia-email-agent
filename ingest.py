@@ -887,7 +887,14 @@ def main():
     dedupe_similar_events(db_conn)
 
     print("\nDone.")
-    imap_conn.logout()
+    try:
+        imap_conn.logout()
+    except Exception as e:
+        # By this point all extraction/saving is already committed to the DB --
+        # a dropped connection during logout (the server closing an idle/long
+        # session) shouldn't be allowed to fail the whole job and skip the
+        # board rebuild + publish steps that come after this script.
+        print(f"WARNING: IMAP logout failed (connection likely already closed by the server) — ignoring: {e}")
     db_conn.close()
 
 
