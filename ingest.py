@@ -41,7 +41,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
 
 TOTAL_EMAIL_LIMIT = 30
-GEMINI_CHUNK_SIZE = 10  # emails per Gemini call; keeps calls small enough to avoid rate limits
+GEMINI_CHUNK_SIZE = 25  # emails per Gemini call. The free tier caps at only 20
+                         # requests per DAY (not per minute) for this model, so
+                         # fewer/bigger calls matter more than avoiding a
+                         # partial-batch loss on failure.
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
@@ -297,7 +300,7 @@ def extract_pdf_bytes_text(payload, label=""):
     page also has some plain text elsewhere on it. Shared by both email attachments
     and PDFs found at links inside an email body.
     """
-    import fitz  # PyMuPDF
+    import pymupdf as fitz  # PyMuPDF (non-deprecated import path)
     text_parts = []
     try:
         doc = fitz.open(stream=payload, filetype="pdf")
@@ -673,13 +676,17 @@ def dedupe_similar_events(conn):
     Removes duplicate/superseded events that build up when the same recurring
     item (e.g. "CCA sign-ups begin") gets mentioned across multiple separate
     emails over time. Two events are only ever considered possible duplicates
-    if they share the same category, year_group, AND date (dates must match --
-    two different activities that happen to use similar generic wording, like
-    "CCA Sign-Up" for two different clubs, must NOT be merged just because the
-    wording is similar; a real duplicate of the same event will also share the
-    same date). On top of that, titles must be a very close textual match
-    (>= 0.85 similarity). Within each matched group, keeps only the one tied
-    to the most recent underlying email, deleting the rest.
+    if they share the same category, year_group, AND a matching, non-null
+    date (two different activities that happen to use similar generic
+    wording, like "CCA Sign-Up" for two different clubs, must NOT be merged
+    just because the wording is similar -- a real duplicate of the same
+    event will also share the same specific date). Undated events are never
+    merged with anything, even if titles are identical, since there's no
+    reliable signal to distinguish a true duplicate from two distinct
+    undated announcements. On top of the date match, titles must also be a
+    very close textual match (>= 0.85 similarity). Within each matched
+    group, keeps only the one tied to the most recent underlying email,
+    deleting the rest.
     """
     rows = conn.execute(
         "SELECT id, title, category, year_group, date, email_date, created_at FROM events"
@@ -711,10 +718,13 @@ def dedupe_similar_events(conn):
             title_j, cat_j, yg_j, date_j = (rows[j][1] or ""), rows[j][2], rows[j][3], rows[j][4]
             if cat_j != cat_i or yg_j != yg_i:
                 continue
-            # Dates must match too -- this is the key guard against merging
-            # genuinely different events that just happen to share generic
-            # wording ("CCA Sign-Up" for two different clubs, for example).
-            if date_i != date_j:
+            # Dates must both be present AND match -- this is the key guard
+            # against merging genuinely different events that just happen to
+            # use similar generic wording ("CCA Sign-Up" for two different
+            # clubs, for example). Two undated items are NEVER merged, even
+            # with identical titles, since there's no reliable way to tell
+            # a true duplicate from two distinct undated announcements.
+            if not date_i or not date_j or date_i != date_j:
                 continue
             ratio = difflib.SequenceMatcher(None, title_i.lower().strip(), title_j.lower().strip()).ratio()
             if ratio >= 0.85:
@@ -775,7 +785,17 @@ def extract_events_batch(model, emails_batch, max_retries=3):
             break
         except Exception as e:
             last_error = e
-            if "429" in str(e) or "quota" in str(e).lower():
+            err_str = str(e)
+            if "perday" in err_str.lower():
+                # This is a DAILY quota cap (Google's free tier allows a small
+                # fixed number of requests per day for this model), not a
+                # transient per-minute rate limit. Retrying within the same
+                # run cannot help -- only waiting for the daily window to
+                # reset will. Give up immediately instead of wasting minutes
+                # on pointless retries.
+                print(f"WARNING: hit the Gemini free-tier DAILY quota — this cannot be fixed by retrying today. Error: {e}")
+                return None
+            if "429" in err_str or "quota" in err_str.lower():
                 wait = 30 * (attempt + 1)
                 print(f"WARNING: rate limited, waiting {wait}s before retry... (error: {e})")
                 time.sleep(wait)
@@ -861,11 +881,12 @@ def main():
     if not emails:
         print("No new emails to process.")
     else:
-        # Send Gemini calls in smaller chunks rather than one giant batch. A
-        # single oversized call is more likely to hit rate limits, and if it
-        # fails after retries, EVERYTHING in it is lost -- not just some of
-        # it. Chunking means a failure only costs that chunk's emails, which
-        # simply stay unprocessed for next run instead of the whole batch.
+        # Send Gemini calls in chunks rather than one single call covering
+        # everything. This still isolates failures (if one chunk's call
+        # fails, only that chunk's emails stay unprocessed for next run,
+        # not the whole batch) while keeping the chunk size large enough
+        # that the total number of calls stays low -- important given the
+        # free tier's daily (not per-minute) request cap.
         chunks = [emails[i:i + GEMINI_CHUNK_SIZE] for i in range(0, len(emails), GEMINI_CHUNK_SIZE)]
         print(f"Sending {len(emails)} email(s) to Gemini in {len(chunks)} batch(es) of up to {GEMINI_CHUNK_SIZE}...")
 
