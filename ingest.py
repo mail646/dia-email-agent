@@ -327,6 +327,7 @@ LINK_SKIP_PATTERNS = [
 ]
 MAX_LINKS_PER_EMAIL = 4
 MAX_LINK_BYTES = 8 * 1024 * 1024  # 8 MB safety cap
+MAX_IMAGES_PER_PAGE = 6  # cap how many embedded images per linked page get OCR'd
 
 
 def extract_links_from_text(html_body, plain_body):
@@ -348,13 +349,36 @@ def extract_links_from_text(html_body, plain_body):
     return filtered[:MAX_LINKS_PER_EMAIL]
 
 
+def extract_image_urls_from_html(html_text, base_url):
+    """
+    Finds <img src="..."> URLs in a fetched HTML page and resolves them to
+    absolute URLs. Many newsletter/CMS pages (calendars, info cards, event
+    flyers) deliver their actual content as designed graphics rather than
+    real text -- plain HTML text extraction alone would silently miss all of
+    that, so these need to be OCR'd separately.
+    """
+    from urllib.parse import urljoin
+    raw_srcs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+    urls = []
+    seen = set()
+    for src in raw_srcs:
+        if src.startswith("data:"):
+            continue  # skip inline base64 images (tiny icons/tracking pixels, not content)
+        absolute = urljoin(base_url, src)
+        if absolute not in seen:
+            seen.add(absolute)
+            urls.append(absolute)
+    return urls[:MAX_IMAGES_PER_PAGE]
+
+
 def fetch_linked_content_text(urls):
     """
     Follows a small number of links found in an email body and pulls text from
     what they point to -- some school newsletters put the actual content on a
-    linked page or hosted PDF rather than in the email itself. HTML pages are
-    extracted as plain text; PDFs go through the same full-page OCR pipeline as
-    attachments.
+    linked page or hosted PDF rather than in the email itself. HTML pages have
+    their plain text extracted AND any embedded images OCR'd (newsletter
+    calendars/info cards are frequently delivered as graphics, not real text);
+    PDFs go through the same full-page OCR pipeline as attachments.
 
     NOTE: pages that render their content via JavaScript (some newsletter
     platforms do) may come back mostly blank here, since this does a plain
@@ -372,12 +396,29 @@ def fetch_linked_content_text(urls):
             content_type = resp.headers.get("Content-Type", "").lower()
             if "pdf" in content_type or url.lower().endswith(".pdf"):
                 text = extract_pdf_bytes_text(resp.content, url)
+                if text and text.strip():
+                    blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
             elif "html" in content_type or not content_type:
                 text = html_to_text(resp.text)
+                if text and text.strip():
+                    blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
+
+                image_urls = extract_image_urls_from_html(resp.text, url)
+                for img_url in image_urls:
+                    try:
+                        img_resp = requests.get(img_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                        if img_resp.status_code != 200 or len(img_resp.content) > MAX_LINK_BYTES:
+                            continue
+                        img_content_type = img_resp.headers.get("Content-Type", "").lower()
+                        if not img_content_type.startswith("image/"):
+                            continue
+                        ocr_text = ocr_image_bytes(img_resp.content, img_url)
+                        if ocr_text and not ocr_text.startswith("[Could not"):
+                            blocks.append(f"--- OCR from image on {url} ({img_url}) ---\n{ocr_text}")
+                    except Exception as e:
+                        blocks.append(f"[Could not fetch/OCR embedded image {img_url}: {e}]")
             else:
                 continue
-            if text and text.strip():
-                blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
         except Exception as e:
             blocks.append(f"[Could not fetch linked content {url}: {e}]")
     return "\n\n".join(blocks)
