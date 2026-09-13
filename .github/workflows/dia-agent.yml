@@ -18,6 +18,10 @@ on:
         description: 'Optional: process this many emails this run instead of the default (e.g. 60 for a catch-up run)'
         required: false
         default: ''
+      chunk_size_override:
+        description: 'Optional: emails per Gemini call (default 1, most thorough). Raise this (e.g. 8-15) temporarily while clearing a large backlog, to conserve daily quota across many older emails'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -58,6 +62,7 @@ jobs:
           FORCE_REPROCESS_KEYWORD: ${{ github.event.inputs.force_reprocess_keyword }}
           FULL_REPROCESS: ${{ github.event.inputs.full_reprocess }}
           EMAIL_LIMIT_OVERRIDE: ${{ github.event.inputs.email_limit_override }}
+          GEMINI_CHUNK_SIZE_OVERRIDE: ${{ github.event.inputs.chunk_size_override }}
         run: python3 -u ingest.py
 
       - name: Build board
