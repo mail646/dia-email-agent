@@ -96,7 +96,10 @@ For each email, identify:
   Date header (the newest information wins), and set "conflict_note" to briefly explain that an earlier email
   gave different information which this newer one supersedes.
 
-Respond ONLY with a single JSON array (no markdown fences, no preamble) combining items from ALL emails. Each item:
+Respond ONLY with a single JSON object (no markdown fences, no preamble) with exactly two keys: "items" and
+"email_summaries".
+
+"items" is an array combining actionable items from ALL emails. Each item:
 {{
   "email_index": 0,
   "title": "short title, e.g. 'Year 8 Sports Day'",
@@ -108,10 +111,20 @@ Respond ONLY with a single JSON array (no markdown fences, no preamble) combinin
   "conflict_note": "explanation if this superseded an earlier conflicting mention, else null"
 }}
 
+"email_summaries" is an array with EXACTLY ONE entry per email in this batch, even for emails with no actionable
+items -- this is a running log of every email processed, not just the ones with deadlines. Each entry:
+{{
+  "email_index": 0,
+  "topic": "one of the allowed topic values above (best guess even if there's no dated item)",
+  "summary": "one short sentence describing what this email is about",
+  "has_actionable": true or false
+}}
+
 The "email_index" field MUST match the number in that email's "=== EMAIL N ===" marker. If an item combines info
 from a NEWER email that supersedes an OLDER one in this same batch, use the email_index of the NEWER email.
-If an email has NO actionable dated information, simply produce no items for it.
-If an email covers multiple distinct items, produce multiple objects with the same email_index.
+If an email has NO actionable dated information, simply produce no "items" entries for it, but STILL include it
+in "email_summaries" with has_actionable set to false.
+If an email covers multiple distinct items, produce multiple "items" objects with the same email_index.
 """
 
 
@@ -155,12 +168,25 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
-    for col in ["topic", "conflict_note"]:
+    for col in ["topic", "conflict_note", "attachment_files"]:
         if col not in existing_cols:
             try:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
             except sqlite3.OperationalError:
                 pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_log (
+            message_id TEXT PRIMARY KEY,
+            subject TEXT,
+            sender TEXT,
+            email_date TEXT,
+            topic TEXT,
+            summary TEXT,
+            has_actionable INTEGER,
+            attachment_files TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     return conn
 
@@ -489,6 +515,7 @@ def get_email_body_and_attachments(msg):
     plain_body = ""
     html_body = ""
     attachment_text_blocks = []
+    attachment_filenames = []
 
     if msg.is_multipart():
         for part in msg.walk():
@@ -507,6 +534,8 @@ def get_email_body_and_attachments(msg):
                 if text.strip():
                     label = filename or content_type
                     attachment_text_blocks.append(f"--- Attachment: {label} ---\n{text}")
+                if filename:
+                    attachment_filenames.append(decode_mime_words(filename))
             elif content_type == "text/plain" and not plain_body:
                 payload = part.get_payload(decode=True)
                 if payload:
@@ -534,7 +563,7 @@ def get_email_body_and_attachments(msg):
         if linked_text.strip():
             attachment_text_blocks.append(linked_text)
 
-    return body, "\n\n".join(attachment_text_blocks)
+    return body, "\n\n".join(attachment_text_blocks), attachment_filenames
 
 
 def get_folder_names(imap_conn):
@@ -650,7 +679,7 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
         msg = email.message_from_bytes(raw_email)
 
         print(f"DEBUG: reading '{cand['subject'][:60]}' from '{cand['folder']}' (extracting attachments/images/HTML)...")
-        body, attachment_text = get_email_body_and_attachments(msg)
+        body, attachment_text, attachment_filenames = get_email_body_and_attachments(msg)
 
         emails.append({
             "message_id": cand["message_id"],
@@ -659,6 +688,7 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
             "date": cand["date_str"],
             "body": body,
             "attachment_text": attachment_text,
+            "attachment_files": ", ".join(attachment_filenames),
         })
 
     print(f"DEBUG: collected {len(emails)} new unprocessed email(s) to send to Gemini (most recent first)")
@@ -855,18 +885,28 @@ def extract_events_batch(model, emails_batch, max_retries=3):
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "items" in parsed:
+            return parsed
+        # Defensive fallback: if the model ignored the object format and
+        # returned a bare array (old format), wrap it so callers always see
+        # the same shape.
+        if isinstance(parsed, list):
+            return {"items": parsed, "email_summaries": []}
+        return {"items": [], "email_summaries": []}
     except json.JSONDecodeError:
         print(f"WARNING: could not parse Gemini batch response:\n{text[:500]}")
-        return []
+        return {"items": [], "email_summaries": []}
 
 
 def save_events(conn, email_data, events):
+    attachment_files = email_data.get("attachment_files", "")
     for ev in events:
         conn.execute("""
             INSERT INTO events (source_message_id, title, date, category, year_group, topic,
-                                 summary, conflict_note, email_subject, email_sender, email_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 summary, conflict_note, email_subject, email_sender, email_date,
+                                 attachment_files, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             email_data["message_id"],
             ev.get("title"),
@@ -879,8 +919,34 @@ def save_events(conn, email_data, events):
             email_data["subject"],
             email_data["sender"],
             email_data["date"],
+            attachment_files,
             datetime.now(timezone.utc).isoformat(),
         ))
+    conn.commit()
+
+
+def save_email_log(conn, email_data, topic, summary, has_actionable):
+    """
+    Records that this email was processed, regardless of whether it produced
+    any actionable items -- this is what powers the Email Summaries view on
+    the board, which (unlike the Deadlines/Events tabs) is meant to show a
+    running log of every email seen, not just the ones with dated items.
+    """
+    conn.execute("""
+        INSERT OR REPLACE INTO email_log
+            (message_id, subject, sender, email_date, topic, summary, has_actionable, attachment_files, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        email_data["message_id"],
+        email_data["subject"],
+        email_data["sender"],
+        email_data["date"],
+        topic,
+        summary,
+        1 if has_actionable else 0,
+        email_data.get("attachment_files", ""),
+        datetime.now(timezone.utc).isoformat(),
+    ))
     conn.commit()
 
 
@@ -933,23 +999,49 @@ def main():
 
         for chunk_index, chunk in enumerate(chunks):
             print(f"--- Batch {chunk_index + 1}/{len(chunks)} ({len(chunk)} email(s)) ---")
-            all_items = extract_events_batch(model, chunk)
+            result = extract_events_batch(model, chunk)
 
-            if all_items is None:
+            if result is None:
                 print("Batch call failed after retries — leaving these emails unprocessed for next run.")
             else:
+                all_items = result.get("items", [])
+                email_summaries = result.get("email_summaries", [])
+
                 by_index = {}
                 for item in all_items:
                     idx = item.get("email_index")
                     by_index.setdefault(idx, []).append(item)
 
+                summary_by_index = {}
+                for es in email_summaries:
+                    idx = es.get("email_index")
+                    if idx is not None:
+                        summary_by_index[idx] = es
+
                 for i, email_data in enumerate(chunk):
                     items = by_index.get(i, [])
+                    es = summary_by_index.get(i)
+
                     if items:
                         save_events(db_conn, email_data, items)
                         print(f"  -> '{email_data['subject'][:50]}': extracted {len(items)} item(s)")
                     else:
                         print(f"  -> '{email_data['subject'][:50]}': no actionable items")
+
+                    # Log this email regardless of whether it had actionable items,
+                    # so the board's Email Summaries view has a complete record.
+                    # Fall back sensibly if the model didn't return a summary entry
+                    # for this particular email.
+                    if es:
+                        log_topic = es.get("topic") or "School Info"
+                        log_summary = es.get("summary") or ""
+                        has_actionable = bool(es.get("has_actionable", bool(items)))
+                    else:
+                        log_topic = items[0].get("topic") if items else "School Info"
+                        log_summary = items[0].get("summary") if items else "No summary available."
+                        has_actionable = bool(items)
+                    save_email_log(db_conn, email_data, log_topic, log_summary, has_actionable)
+
                     mark_processed(db_conn, email_data["message_id"], email_data.get("subject"))
 
             if chunk_index < len(chunks) - 1:
