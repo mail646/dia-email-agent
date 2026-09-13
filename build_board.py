@@ -23,8 +23,21 @@ def fetch_events():
     return [dict(r) for r in rows]
 
 
-def build_html(rows):
+def fetch_email_log():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM email_log ORDER BY email_date DESC").fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # table may not exist yet on an old DB that hasn't run the new ingest.py
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def build_html(rows, email_log_rows=None):
+    email_log_rows = email_log_rows or []
     data_json = json.dumps(rows, default=str)
+    email_log_json = json.dumps(email_log_rows, default=str)
     updated = datetime.now().strftime('%d %b %Y, %H:%M')
 
     return f"""<!DOCTYPE html>
@@ -119,6 +132,24 @@ def build_html(rows):
     border-radius: 5px; background: #f1efe9; color: #6b6a63; margin-right: 5px;
     letter-spacing: 0.01em;
   }}
+  .tag-todo {{ background: #fdeee8; color: var(--urgent); }}
+  .stats-grid {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px;
+    margin-bottom: 22px;
+  }}
+  .stat-card {{
+    background: var(--card); border-radius: 10px; padding: 16px 14px; text-align: center;
+    box-shadow: var(--shadow);
+  }}
+  .stat-value {{
+    font-family: 'Source Serif 4', Georgia, serif; font-weight: 700; font-size: 1.7em; color: var(--ink);
+  }}
+  .stat-label {{ font-size: 0.76em; color: var(--muted); margin-top: 4px; }}
+  .stats-subhead {{
+    font-family: 'Source Serif 4', Georgia, serif; font-weight: 700; font-size: 1.05em;
+    margin: 22px 0 12px;
+  }}
+  .stats-daterange {{ font-size: 0.85em; color: var(--muted); margin-top: 6px; }}
   .empty {{ color: var(--muted); font-style: italic; padding: 28px 0; text-align: center; }}
   .toggle-passed {{
     margin: 12px 0; font-size: 0.82em; color: var(--muted); cursor: pointer;
@@ -182,6 +213,8 @@ def build_html(rows):
     <div class="tab" data-view="events" onclick="switchTab('events')">Events</div>
     <div class="tab" data-view="calendar" onclick="switchTab('calendar')">Calendar</div>
     <div class="tab" data-view="summaries" onclick="switchTab('summaries')">All Items</div>
+    <div class="tab" data-view="emaillog" onclick="switchTab('emaillog')">Email Summaries</div>
+    <div class="tab" data-view="stats" onclick="switchTab('stats')">Stats</div>
   </div>
 
   <h2 class="section-title" id="sectionTitle">Deadlines</h2>
@@ -189,6 +222,8 @@ def build_html(rows):
   <div class="view" id="view-events"></div>
   <div class="view" id="view-calendar"></div>
   <div class="view" id="view-summaries"></div>
+  <div class="view" id="view-emaillog"></div>
+  <div class="view" id="view-stats"></div>
 
   <div class="source-overlay" id="sourceOverlay" onclick="if(event.target===this) closeSource()">
     <div class="source-card">
@@ -204,8 +239,9 @@ def build_html(rows):
 
 <script>
 const DATA = {data_json};
+const EMAIL_LOG = {email_log_json};
 const CATEGORY_COLORS = {{deadline:'#c0392b', event:'#1a7a6a', task:'#c98a1c', announcement:'#8a8a8e'}};
-const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items'}};
+const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items', emaillog:'Email Summaries', stats:'Stats'}};
 
 // Maps the old 7-value topic taxonomy onto the current 3-category system, so
 // the board only ever shows Academics/School Info/Activities chips even if
@@ -344,6 +380,7 @@ function itemHtml(item) {{
   const relCls = past ? 'muted' : urgencyClass(item.date);
   const barColor = past ? 'var(--line)' : urgencyColor(item.date);
   const conflict = item.conflict_note ? `<div class="item-conflict">⚠ ${{item.conflict_note}}</div>` : '';
+  const attachments = item.attachment_files ? ` · [${{item.attachment_files}}]` : '';
   return `<div class="item ${{past ? 'past' : ''}}" onclick="showSource(${{item.id}})">
     <div class="urgency-bar" style="background:${{barColor}}"></div>
     <div class="item-body">
@@ -355,7 +392,7 @@ function itemHtml(item) {{
         <div class="item-meta">
           <span class="tag">${{item.year_group || 'All'}}</span>
           ${{item.topic ? `<span class="tag">${{normalizeTopic(item.topic)}}</span>` : ''}}
-          from "${{item.email_subject || ''}}"
+          from "${{item.email_subject || ''}}"${{attachments}}
         </div>
       </div>
     </div>
@@ -474,6 +511,108 @@ function changeMonth(delta) {{
   renderCalendar();
 }}
 
+function renderEmailLog() {{
+  const q = document.getElementById('search').value.toLowerCase().trim();
+  let entries = EMAIL_LOG.filter(e => {{
+    if (activeTopic !== 'All' && normalizeTopic(e.topic) !== activeTopic) return false;
+    if (q) {{
+      const haystack = `${{e.subject || ''}} ${{e.summary || ''}}`.toLowerCase();
+      if (!fuzzyIncludes(haystack, q)) return false;
+    }}
+    return true;
+  }});
+  entries.sort((a, b) => (new Date(b.email_date) - new Date(a.email_date)) || 0);
+
+  if (entries.length === 0) {{
+    document.getElementById('view-emaillog').innerHTML = '<div class="empty">No emails logged yet.</div>';
+    return;
+  }}
+
+  const html = entries.map(e => {{
+    const todoBadge = e.has_actionable ? '<span class="tag tag-todo">TO DO</span>' : '';
+    const attachments = e.attachment_files ? ` · [${{e.attachment_files}}]` : '';
+    let dateStr = '';
+    try {{ dateStr = new Date(e.email_date).toLocaleDateString('en-GB', {{day:'numeric', month:'short'}}); }} catch (err) {{}}
+    return `<div class="item">
+      <div class="urgency-bar" style="background:var(--line)"></div>
+      <div class="item-body">
+        <div class="rel muted">${{dateStr}}</div>
+        <div>
+          <div class="item-title">${{e.subject || '(no subject)'}}</div>
+          <div class="item-summary">${{e.summary || ''}}</div>
+          <div class="item-meta">
+            <span class="tag">${{normalizeTopic(e.topic)}}</span>${{todoBadge}}${{attachments}}
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }}).join('');
+
+  document.getElementById('view-emaillog').innerHTML = html;
+}}
+
+function renderStats() {{
+  const totalEmails = EMAIL_LOG.length;
+  const withActionable = EMAIL_LOG.filter(e => e.has_actionable).length;
+  const noActionable = totalEmails - withActionable;
+  const totalItems = DATA.length;
+
+  const topicCounts = {{}};
+  CANONICAL_TOPICS.forEach(t => topicCounts[t] = 0);
+  DATA.forEach(i => {{
+    const t = normalizeTopic(i.topic);
+    topicCounts[t] = (topicCounts[t] || 0) + 1;
+  }});
+
+  const categoryCounts = {{}};
+  DATA.forEach(i => {{
+    const c = i.category || 'other';
+    categoryCounts[c] = (categoryCounts[c] || 0) + 1;
+  }});
+
+  const childCounts = {{}};
+  CHILDREN.filter(c => c.id !== 'All').forEach(child => {{
+    childCounts[child.label] = DATA.filter(i => {{
+      const yg = i.year_group || '';
+      return yg === 'All' || yg === child.stage || child.years.includes(yg);
+    }}).length;
+  }});
+
+  let dateRangeStr = '—';
+  const validDates = EMAIL_LOG.map(e => new Date(e.email_date)).filter(d => !isNaN(d));
+  if (validDates.length > 0) {{
+    const minD = new Date(Math.min(...validDates));
+    const maxD = new Date(Math.max(...validDates));
+    const fmt = d => d.toLocaleDateString('en-GB', {{day:'numeric', month:'short', year:'numeric'}});
+    dateRangeStr = `${{fmt(minD)}} – ${{fmt(maxD)}}`;
+  }}
+
+  const statCard = (label, value) => `<div class="stat-card"><div class="stat-value">${{value}}</div><div class="stat-label">${{label}}</div></div>`;
+
+  let html = '<div class="stats-grid">';
+  html += statCard('Emails processed', totalEmails);
+  html += statCard('With actionable items', withActionable);
+  html += statCard('No action needed', noActionable);
+  html += statCard('Total items extracted', totalItems);
+  html += '</div>';
+
+  html += '<h3 class="stats-subhead">By topic</h3><div class="stats-grid">';
+  CANONICAL_TOPICS.forEach(t => {{ html += statCard(t, topicCounts[t] || 0); }});
+  html += '</div>';
+
+  html += '<h3 class="stats-subhead">By category</h3><div class="stats-grid">';
+  Object.keys(categoryCounts).forEach(c => {{ html += statCard(c.charAt(0).toUpperCase() + c.slice(1) + 's', categoryCounts[c]); }});
+  html += '</div>';
+
+  html += '<h3 class="stats-subhead">By child</h3><div class="stats-grid">';
+  Object.keys(childCounts).forEach(label => {{ html += statCard(label, childCounts[label]); }});
+  html += '</div>';
+
+  html += `<div class="stats-daterange">Emails span: <strong>${{dateRangeStr}}</strong></div>`;
+
+  document.getElementById('view-stats').innerHTML = html;
+}}
+
 function switchTab(view) {{
   currentTab = view;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
@@ -488,6 +627,8 @@ function render() {{
   renderList('view-events', filtered.filter(i => i.category === 'event'), showPassedEvents, 'toggleEventsPassed()');
   renderList('view-summaries', filtered, true, '');
   if (currentTab === 'calendar') renderCalendar();
+  if (currentTab === 'emaillog') renderEmailLog();
+  if (currentTab === 'stats') renderStats();
 }}
 
 function buildTopicChips() {{
@@ -525,10 +666,11 @@ render();
 
 def main():
     rows = fetch_events()
-    html = build_html(rows)
+    email_log_rows = fetch_email_log()
+    html = build_html(rows, email_log_rows)
     with open(OUTPUT_PATH, "w") as f:
         f.write(html)
-    print(f"Wrote {OUTPUT_PATH} ({len(rows)} events)")
+    print(f"Wrote {OUTPUT_PATH} ({len(rows)} events, {len(email_log_rows)} logged emails)")
 
 
 if __name__ == "__main__":
