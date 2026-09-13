@@ -41,10 +41,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = "gemini-3.6-flash"
 
 TOTAL_EMAIL_LIMIT = 30
-GEMINI_CHUNK_SIZE = 25  # emails per Gemini call. The free tier caps at only 20
-                         # requests per DAY (not per minute) for this model, so
-                         # fewer/bigger calls matter more than avoiding a
-                         # partial-batch loss on failure.
+GEMINI_CHUNK_SIZE = 1  # emails per Gemini call. Steady-state volume from the school
+                        # is only a handful of emails a day, so there's no reason to
+                        # economize here -- one email per call gives the model's full
+                        # attention to each one (most thorough possible reading) while
+                        # using only a few of the free tier's 20 daily requests. Use
+                        # GEMINI_CHUNK_SIZE_OVERRIDE to temporarily raise this while
+                        # still working through a large backlog, to conserve quota
+                        # across many older emails at once.
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 
@@ -66,7 +70,15 @@ Some emails include text extracted from PDF/Word/Excel/PowerPoint attachments or
 flyers, posters, forms) — treat this extracted text with the same importance as the email body itself, even if
 it has OCR noise/typos.
 
-For each email, identify:
+BE EXHAUSTIVE. A single email or attachment very often bundles MANY distinct dated items together -- e.g. a
+"Sports Trials" flyer with a different trial date for each sport and year group, a "Weekly Notices" email
+covering five unrelated announcements, or a form with separate deadlines for different grades. Extract EVERY
+one of these as its OWN separate item. Do not collapse several distinct dated things into one vague summary
+item, and do not skip smaller or seemingly minor items just because the email is long or covers many topics --
+a parent would rather see ten small items than miss one that mattered to their child. When in doubt about
+whether something is "actionable enough" to include, include it.
+
+For each item you extract, identify:
 - Any deadlines, events, tasks, tests/assignments, or announcements with a date attached.
 - Whole-school calendar items too: closures, holidays, early-dismissal days, etc. -- capture these as "event"
   category items. IMPORTANT: if the SAME closure/dismissal has different dates or times for different stages
@@ -112,18 +124,24 @@ Respond ONLY with a single JSON object (no markdown fences, no preamble) with ex
 }}
 
 "email_summaries" is an array with EXACTLY ONE entry per email in this batch, even for emails with no actionable
-items -- this is a running log of every email processed, not just the ones with deadlines. Each entry:
+items -- this is a THOROUGH running log of every email processed, not a one-line gloss and not just the ones
+with deadlines. For this entry, actually read the full email body AND every attachment/OCR'd
+image/PDF/linked-page text in full -- do not skim. Each entry:
 {{
   "email_index": 0,
   "topic": "one of the allowed topic values above (best guess even if there's no dated item)",
-  "summary": "one short sentence describing what this email is about",
+  "summary": "a thorough summary (a full paragraph, or several bullet-style sentences) covering EVERYTHING
+              substantive in this email and its attachments/images/links -- names of staff or students
+              mentioned, numbers, instructions, context, background, minor announcements, anything a parent
+              would want on record -- not just deadlines. If the email is long or covers many topics, cover
+              all of them; do not compress a multi-topic email down to one generic sentence.",
   "has_actionable": true or false
 }}
 
 The "email_index" field MUST match the number in that email's "=== EMAIL N ===" marker. If an item combines info
 from a NEWER email that supersedes an OLDER one in this same batch, use the email_index of the NEWER email.
 If an email has NO actionable dated information, simply produce no "items" entries for it, but STILL include it
-in "email_summaries" with has_actionable set to false.
+in "email_summaries" with has_actionable set to false and a full, thorough summary as described above.
 If an email covers multiple distinct items, produce multiple "items" objects with the same email_index.
 """
 
@@ -697,17 +715,19 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
 
 def full_reprocess_wipe(conn):
     """
-    Wipes the entire processed-messages history and all extracted events, so
-    the next fetch treats every single email since Jan 2025 as brand new and
-    re-runs it through whatever the current extraction logic is. Useful after
-    a meaningful pipeline improvement (e.g. full-page OCR, link-following),
-    since emails processed under an older, buggier version are otherwise
-    permanently stuck with incomplete results -- this forces a clean slate.
+    Wipes the entire processed-messages history, all extracted events, and
+    the email log, so the next fetch treats every single email since Jan
+    2025 as brand new and re-runs it through whatever the current
+    extraction logic is. Useful after a meaningful pipeline improvement
+    (e.g. full-page OCR, link-following), since emails processed under an
+    older, buggier version are otherwise permanently stuck with incomplete
+    results -- this forces a genuinely clean slate.
     """
     conn.execute("DELETE FROM events")
     conn.execute("DELETE FROM processed_messages")
+    conn.execute("DELETE FROM email_log")
     conn.commit()
-    print("DEBUG: FULL REPROCESS requested -- wiped all events and processed-message history")
+    print("DEBUG: FULL REPROCESS requested -- wiped all events, processed-message history, and email log")
 
 
 def force_reprocess_by_keyword(conn, keyword):
@@ -715,12 +735,11 @@ def force_reprocess_by_keyword(conn, keyword):
     Lets a specific past email be re-processed under the current (improved)
     extraction logic, for cases where an email was marked "processed" before a
     fix (e.g. full-page OCR) existed, and so is permanently stuck with its old,
-    incomplete results. Matches against both the events table's email_subject
-    (works for any email that already produced at least one event) and
-    processed_messages' subject column (works even for emails that previously
-    produced zero events, as long as they were processed after this column was
-    added). Clears the matching message(s) from processed_messages and deletes
-    their existing events, so the next fetch treats them as brand new.
+    incomplete results. Matches against the events table's email_subject, the
+    processed_messages table's subject column, and the email_log table's
+    subject column, so it finds a message regardless of whether it produced
+    any events. Clears the matching message(s) from all three tables, so the
+    next fetch treats them as brand new.
     """
     keyword = (keyword or "").strip()
     if not keyword:
@@ -732,12 +751,16 @@ def force_reprocess_by_keyword(conn, keyword):
     ids_from_processed = conn.execute(
         "SELECT DISTINCT message_id FROM processed_messages WHERE subject LIKE ?", (like,)
     ).fetchall()
-    message_ids = {row[0] for row in (ids_from_events + ids_from_processed) if row[0]}
+    ids_from_log = conn.execute(
+        "SELECT DISTINCT message_id FROM email_log WHERE subject LIKE ?", (like,)
+    ).fetchall()
+    message_ids = {row[0] for row in (ids_from_events + ids_from_processed + ids_from_log) if row[0]}
     if not message_ids:
         print(f"DEBUG: force-reprocess keyword '{keyword}' matched no known message subject")
         return
     conn.executemany("DELETE FROM processed_messages WHERE message_id = ?", [(m,) for m in message_ids])
     conn.executemany("DELETE FROM events WHERE source_message_id = ?", [(m,) for m in message_ids])
+    conn.executemany("DELETE FROM email_log WHERE message_id = ?", [(m,) for m in message_ids])
     conn.commit()
     print(f"DEBUG: cleared {len(message_ids)} message(s) matching '{keyword}' for reprocessing")
 
@@ -975,6 +998,13 @@ def main():
         email_limit = int(limit_override)
         print(f"DEBUG: per-run email limit overridden to {email_limit} (default is {TOTAL_EMAIL_LIMIT})")
 
+    chunk_size = GEMINI_CHUNK_SIZE
+    chunk_override = os.environ.get("GEMINI_CHUNK_SIZE_OVERRIDE", "").strip()
+    if chunk_override.isdigit() and int(chunk_override) > 0:
+        chunk_size = int(chunk_override)
+        print(f"DEBUG: Gemini chunk size overridden to {chunk_size} (default is {GEMINI_CHUNK_SIZE}) "
+              f"-- larger means less thorough per-email reading, but conserves daily quota for backlog catch-up")
+
     deleted = db_conn.execute("DELETE FROM events WHERE date IS NOT NULL AND date < '2025-01-01'").rowcount
     db_conn.commit()
     print(f"DEBUG: cleared {deleted} old event(s) from before 2025")
@@ -994,8 +1024,8 @@ def main():
         # not the whole batch) while keeping the chunk size large enough
         # that the total number of calls stays low -- important given the
         # free tier's daily (not per-minute) request cap.
-        chunks = [emails[i:i + GEMINI_CHUNK_SIZE] for i in range(0, len(emails), GEMINI_CHUNK_SIZE)]
-        print(f"Sending {len(emails)} email(s) to Gemini in {len(chunks)} batch(es) of up to {GEMINI_CHUNK_SIZE}...")
+        chunks = [emails[i:i + chunk_size] for i in range(0, len(emails), chunk_size)]
+        print(f"Sending {len(emails)} email(s) to Gemini in {len(chunks)} batch(es) of up to {chunk_size}...")
 
         for chunk_index, chunk in enumerate(chunks):
             print(f"--- Batch {chunk_index + 1}/{len(chunks)} ({len(chunk)} email(s)) ---")
