@@ -263,11 +263,14 @@ function normalizeTopic(topic) {{
 // `stage` records which school stage each child is in (Primary = Years 1-6,
 // Secondary = Years 7-13 at DIA Emirates Hills). This lets the filter logic
 // correctly match stage-wide items (year_group "Primary"/"Secondary") to the
-// right child, instead of only matching exact year strings.
+// right child, instead of only matching exact year strings. `class` is their
+// specific homeroom (e.g. "5A") -- used to exclude emails addressed to a
+// DIFFERENT class in the same year (e.g. a "Welcome to 5B" email shouldn't
+// show up for a child in 5A, even though both are Year 5).
 const CHILDREN = [
   {{ id: 'All', label: 'All' }},
-  {{ id: 'Evelyn', label: 'Evelyn · Year 5', years: ['Year 5'], stage: 'Primary' }},
-  {{ id: 'Milo', label: 'Milo · Year 8', years: ['Year 8'], stage: 'Secondary' }},
+  {{ id: 'Evelyn', label: 'Evelyn · Year 5', years: ['Year 5'], stage: 'Primary', class: '5A' }},
+  {{ id: 'Milo', label: 'Milo · Year 8', years: ['Year 8'], stage: 'Secondary', class: '8C' }},
 ];
 
 let activeTopic = 'All';
@@ -348,6 +351,12 @@ function fuzzyIncludes(haystack, needle) {{
 }}
 
 function itemMatchesChild(item, child) {{
+  // If this item is addressed to one specific homeroom class, it should
+  // only match a child actually in that class -- e.g. a "Welcome to 5B"
+  // email must NOT show for a child in 5A, even though both are Year 5.
+  if (item.class_group && item.class_group.trim() && item.class_group.trim() !== child.class) {{
+    return false;
+  }}
   const yg = item.year_group || '';
   // year_group can be a single value ("Year 8", "Primary", "All") or a
   // comma-separated combination of specific years ("Year 1, Year 2") when
