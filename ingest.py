@@ -56,7 +56,7 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
 # genuinely whole-school items. Primary = Years 1-6, Secondary = Years 7-13
 # at DIA Emirates Hills.
 YEAR_GROUPS = [
-    "Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9",
+    "Kindergarten", "Year 4", "Year 5", "Year 6", "Year 7", "Year 8", "Year 9",
     "Year 10", "Year 11", "Year 12", "Year 13",
     "Primary", "Secondary", "All",
 ]
@@ -85,14 +85,24 @@ For each item you extract, identify:
   (e.g. Primary finishes at 11am but Secondary finishes at 12pm, or the stages break for a holiday on different
   days), create SEPARATE items -- one per stage/year group -- each with its own correct date and year_group.
   Do not collapse per-stage differences into a single item with just one date.
-- Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}).
+- Which year group(s) it applies to (choose from: {", ".join(YEAR_GROUPS)}, or a comma-separated combination of
+  specific years -- see below).
+  - Use "Kindergarten" when an email is specifically about KG1 and/or KG2 only, with no Year 1+ content.
+    Do NOT tag Kindergarten-only content as "Primary" -- "Primary" specifically means Years 1-6, not KG.
   - Use a specific year like "Year 8" when the email clearly names one year group.
-  - Use "Primary" when it applies broadly across Primary (Years 1-6) but not the whole school —
+  - If an item names an explicit SUBSET of years that is NOT the whole stage -- e.g. a session specifically for
+    "Year 1 and Year 2" only, or trials for "Year 3-4" only -- combine the specific years with commas, e.g.
+    "Year 1, Year 2" or "Year 3, Year 4". Do NOT round this up to "Primary" just because several years are
+    named; only use the broad stage tag when the item genuinely applies to the WHOLE stage, not a subset of it.
+    This matters a lot: schools often bundle several separate sessions in one email, each for a different pair
+    of years (e.g. one session for KG1-2, another for Year 1-2, another for Year 3-4, another for Year 5-6) --
+    each of those is a SEPARATE item with its OWN specific year combination, not one "Primary" item.
+  - Use "Primary" when it applies broadly across the WHOLE of Primary Years 1-6 (not KG, not the whole school) —
     e.g. an email addressed to "Year 7-13" or "Secondary" should be tagged "Secondary", NOT "All".
-  - Use "Secondary" when it applies broadly across Secondary (Years 7-13) but not the whole school.
+  - Use "Secondary" when it applies broadly across the WHOLE of Secondary (Years 7-13) but not the whole school.
   - Only use "All" when the email is genuinely whole-school, or you truly cannot tell which stage/year it targets.
-  - Do not default to "All" just because a range of years is mentioned — pick "Primary" or "Secondary" if the
-    range sits entirely within one stage.
+  - Do not default to "All" or to a broad stage tag just because a range of years is mentioned — pick the exact
+    years, or "Kindergarten"/"Primary"/"Secondary", based on what's actually stated.
 - Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)}):
   - "Academics": tests, exams, assignments/homework due, academic assessments (e.g. CAT4), and the release of
     report cards, exam results, or parent reports.
@@ -810,7 +820,18 @@ def dedupe_similar_events(conn):
             if id_j in used:
                 continue
             title_j, cat_j, yg_j, date_j = (rows[j][1] or ""), rows[j][2], rows[j][3], rows[j][4]
-            if cat_j != cat_i or yg_j != yg_i:
+            if cat_j != cat_i:
+                continue
+            # year_group must match exactly, EXCEPT that "All" is treated as
+            # compatible with any other value -- "All" is a strict superset
+            # of every specific year/stage, so a whole-school mention of an
+            # event and a stage-specific mention of the SAME event (matching
+            # date + near-identical title) are almost certainly duplicates,
+            # not two different things. This does not loosen the guard for
+            # two different specific tags (e.g. "Secondary" vs "Year 8"),
+            # which still must match exactly.
+            yg_compatible = (yg_j == yg_i) or yg_i == "All" or yg_j == "All"
+            if not yg_compatible:
                 continue
             # Dates must both be present AND match -- this is the key guard
             # against merging genuinely different events that just happen to
@@ -820,14 +841,49 @@ def dedupe_similar_events(conn):
             # a true duplicate from two distinct undated announcements.
             if not date_i or not date_j or date_i != date_j:
                 continue
-            ratio = difflib.SequenceMatcher(None, title_i.lower().strip(), title_j.lower().strip()).ratio()
-            if ratio >= 0.85:
+            title_i_norm = title_i.lower().strip()
+            title_j_norm = title_j.lower().strip()
+            ratio = difflib.SequenceMatcher(None, title_i_norm, title_j_norm).ratio()
+            # A long title fully contained inside another (e.g. "Inclusion
+            # Coffee Morning" inside "Secondary Inclusion Coffee Morning") is
+            # a strong, specific signal of the same event described with an
+            # extra qualifier word -- catches cases the similarity ratio
+            # alone scores just under threshold on, without the looseness
+            # that caused genuinely different titles to over-merge before
+            # (unrelated titles essentially never contain one another).
+            substring_match = (
+                len(title_i_norm) >= 10 and len(title_j_norm) >= 10
+                and (title_i_norm in title_j_norm or title_j_norm in title_i_norm)
+            )
+            # Word-overlap: catches cases like "Staff PD Day (Early
+            # Dismissal)" vs "Innoventures Education PD Day (Early
+            # Dismissal)" -- the same event named with a different
+            # organizational prefix, sharing most of their meaningful words
+            # but different enough in raw text/substring to miss the checks
+            # above. Requires BOTH a high proportion of shared words AND at
+            # least 3 shared words, so short titles with one incidental
+            # shared word (e.g. "PE" / "PE Day") can't false-positive.
+            words_i = set(re.findall(r"[a-z0-9]+", title_i_norm))
+            words_j = set(re.findall(r"[a-z0-9]+", title_j_norm))
+            shared_words = words_i & words_j
+            word_overlap = (
+                len(shared_words) / len(words_i | words_j) if (words_i or words_j) else 0
+            )
+            word_match = word_overlap >= 0.55 and len(shared_words) >= 3
+            if ratio >= 0.85 or substring_match or word_match:
                 group.append(rows[j])
         if len(group) > 1:
-            group_sorted = sorted(group, key=sort_key, reverse=True)
-            for row in group_sorted[1:]:
-                to_delete.append(row[0])
+            # If the group contains an "All"-tagged version, prefer keeping
+            # that one -- it's a strict superset of any narrower tag in the
+            # same group, so keeping it never hides the event from anyone
+            # who should see it. Recency is still used as the tiebreak among
+            # whichever subset (All-tagged, or otherwise) applies.
+            all_tagged = [r for r in group if r[3] == "All"]
+            preferred_pool = all_tagged if all_tagged else group
+            keep = sorted(preferred_pool, key=sort_key, reverse=True)[0]
             for row in group:
+                if row[0] != keep[0]:
+                    to_delete.append(row[0])
                 used.add(row[0])
         else:
             used.add(id_i)
@@ -861,6 +917,91 @@ def retag_legacy_topics(conn):
     if updated:
         conn.commit()
         print(f"DEBUG: migrated {updated} event(s) from the old topic taxonomy to Academics/School Info/Activities")
+
+
+def retag_kindergarten_only_items(conn):
+    """
+    Fixes existing events that were tagged "Primary" or "All" before the
+    dedicated "Kindergarten" tag existed, even though they're specifically
+    about KG1/KG2 only (e.g. "KG1 & KG2 Parent Information Session"). Without
+    this, such items incorrectly show up under a Year 5 child's filter, since
+    "Primary" is treated as covering that child's stage. Only retags rows
+    that mention KG1/KG2/Kindergarten AND do not also mention any Year 1+
+    group -- genuinely whole-Primary content (which legitimately spans
+    KG1 through Year 6, e.g. many "KG1-Y6" newsletters) is left untouched.
+    """
+    year_mention_re = re.compile(r"\byear\s*([1-9]|1[0-3])\b", re.IGNORECASE)
+    kg_mention_re = re.compile(r"\bkg\s*1\b|\bkg\s*2\b|\bkindergarten\b", re.IGNORECASE)
+
+    rows = conn.execute(
+        "SELECT id, title, summary, email_subject FROM events WHERE year_group IN ('Primary', 'All')"
+    ).fetchall()
+    updated = 0
+    for row_id, title, summary, email_subject in rows:
+        text = f"{title or ''} {summary or ''} {email_subject or ''}"
+        if kg_mention_re.search(text) and not year_mention_re.search(text):
+            conn.execute("UPDATE events SET year_group = 'Kindergarten' WHERE id = ?", (row_id,))
+            updated += 1
+    if updated:
+        conn.commit()
+        print(f"DEBUG: retagged {updated} KG-only item(s) from Primary/All to Kindergarten")
+
+
+def extract_mentioned_years(text):
+    """Finds explicit Year mentions in text, including both single mentions
+    ("Year 5") and hyphenated ranges ("Year 3-4", "Years 4 to 6"). Returns a
+    set of integer year numbers (1-13)."""
+    years = set()
+    for m in re.finditer(r"years?\s*(\d{1,2})\s*(?:-|to)\s*(\d{1,2})", text, re.IGNORECASE):
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if 1 <= lo <= hi <= 13 and (hi - lo) <= 12:
+            years.update(range(lo, hi + 1))
+    for m in re.finditer(r"\byears?\s*(\d{1,2})\b", text, re.IGNORECASE):
+        n = int(m.group(1))
+        if 1 <= n <= 13:
+            years.add(n)
+    return years
+
+
+def retag_year_subset_items(conn):
+    """
+    Fixes existing events tagged broadly "Primary"/"Secondary"/"All" that
+    actually name an explicit SUBSET of years -- e.g. "Year 1 & Year 2 Parent
+    Information Session" -- rather than the whole stage. Schools often bundle
+    several separate sessions in one email, each for a different pair of
+    years; without this, every one of them gets rounded up to "Primary" and
+    incorrectly matches every Primary child's filter, not just the ones it's
+    actually for. Only uses the item's own title/summary (not the shared
+    email_subject, which can mention a broader range for the newsletter as a
+    whole and would cause false narrowing). Leaves alone anything that
+    mentions the FULL stage range (e.g. "Year 1-6") or spans both stages, or
+    has no explicit year mention at all.
+    """
+    rows = conn.execute(
+        "SELECT id, title, summary, year_group FROM events WHERE year_group IN ('Primary', 'Secondary', 'All')"
+    ).fetchall()
+    updated = 0
+    for row_id, title, summary, current_yg in rows:
+        text = f"{title or ''} {summary or ''}"
+        years = extract_mentioned_years(text)
+        if not years:
+            continue
+        primary_years = {y for y in years if 1 <= y <= 6}
+        secondary_years = {y for y in years if 7 <= y <= 13}
+        if primary_years and not secondary_years and primary_years != set(range(1, 7)):
+            new_yg = ", ".join(f"Year {y}" for y in sorted(primary_years))
+            conn.execute("UPDATE events SET year_group = ? WHERE id = ?", (new_yg, row_id))
+            updated += 1
+        elif secondary_years and not primary_years and secondary_years != set(range(7, 14)):
+            new_yg = ", ".join(f"Year {y}" for y in sorted(secondary_years))
+            conn.execute("UPDATE events SET year_group = ? WHERE id = ?", (new_yg, row_id))
+            updated += 1
+        # Mixed-stage mentions or a full-stage match are left as-is.
+    if updated:
+        conn.commit()
+        print(f"DEBUG: retagged {updated} item(s) from broad Primary/Secondary/All to specific year subsets")
+
+
 
 
 def extract_events_batch(model, emails_batch, max_retries=3):
@@ -987,6 +1128,8 @@ def main():
 
     retag_legacy_all_items(db_conn)
     retag_legacy_topics(db_conn)
+    retag_kindergarten_only_items(db_conn)
+    retag_year_subset_items(db_conn)
 
     force_reprocess_keyword = os.environ.get("FORCE_REPROCESS_KEYWORD", "").strip()
     if force_reprocess_keyword:
