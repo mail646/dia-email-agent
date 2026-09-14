@@ -232,6 +232,7 @@ def build_html(rows, email_log_rows=None):
       <div class="source-row"><strong>Subject:</strong> <span id="srcSubject"></span></div>
       <div class="source-row"><strong>Date:</strong> <span id="srcDate"></span></div>
       <div class="source-hint" id="srcHint"></div>
+      <button class="source-btn" id="srcOpenBtn" style="display:none">Open in Mail</button>
       <button class="source-btn" onclick="copySourceSubject()">Copy subject to search Mail</button>
       <button class="source-btn source-btn-close" onclick="closeSource()">Close</button>
     </div>
@@ -361,15 +362,14 @@ function matchesFilters(item) {{
   if (activeChild !== 'All') {{
     const child = CHILDREN.find(c => c.id === activeChild);
     const yg = item.year_group || '';
-    if (yg === 'All') {{
-      // genuinely whole-school items always match
-    }} else if (yg === child.stage) {{
-      // stage-wide item (e.g. "Secondary") matches any child in that stage
-    }} else if (child.years.includes(yg)) {{
-      // exact year match (e.g. "Year 8")
-    }} else {{
-      return false;
-    }}
+    // year_group can be a single value ("Year 8", "Primary", "All") or a
+    // comma-separated combination of specific years ("Year 1, Year 2") when
+    // an item names an explicit subset of years rather than a whole stage.
+    const ygParts = yg.split(',').map(s => s.trim()).filter(Boolean);
+    const matches = ygParts.some(part =>
+      part === 'All' || part === child.stage || child.years.includes(part)
+    );
+    if (!matches) return false;
   }}
   return true;
 }}
@@ -419,6 +419,21 @@ function renderList(containerId, items, passedFlag, setPassedFlag) {{
   document.getElementById(containerId).innerHTML = html;
 }}
 
+function buildMailMessageLink(rawId) {{
+  if (!rawId) return null;
+  let id = String(rawId).trim();
+  if (id.startsWith('<') && id.endsWith('>')) {{
+    id = id.slice(1, -1);
+  }}
+  if (!id) return null;
+  // Apple Mail's own internal, UNOFFICIAL link scheme for opening a specific
+  // message by its Message-ID. Not publicly documented by Apple, not
+  // guaranteed to keep working, and only works with Apple's own Mail app
+  // (not Gmail or other mail apps) on a device where this account is
+  // already set up.
+  return 'message:%3C' + encodeURIComponent(id) + '%3E';
+}}
+
 function showSource(id) {{
   const item = DATA.find(d => Number(d.id) === Number(id));
   if (!item) return;
@@ -433,11 +448,20 @@ function showSource(id) {{
 
   const domainMatch = sender.match(/@([\\w.-]+)/);
   const domain = domainMatch ? domainMatch[1].toLowerCase() : '';
+  const mailLink = buildMailMessageLink(item.source_message_id);
+  const openBtn = document.getElementById('srcOpenBtn');
+
   let hint;
   if (domain && domain !== 'diadubai.com') {{
     hint = `This came from ${{domain}}, not a direct school email — check that app/platform for the original message.`;
+    openBtn.style.display = 'none';
+  }} else if (mailLink) {{
+    hint = `Tap "Open in Mail" to try jumping straight to this email (works only in Apple's own Mail app, and isn't guaranteed). If it doesn't open, use "Copy subject" and paste it into Mail's search instead.`;
+    openBtn.style.display = 'block';
+    openBtn.onclick = () => {{ window.location.href = mailLink; }};
   }} else {{
     hint = `iCloud Mail doesn't support jumping straight to one email from here. Tap "Copy subject" below, then paste it into Mail's search bar to find the original.`;
+    openBtn.style.display = 'none';
   }}
   document.getElementById('srcHint').textContent = hint;
   window.__lastSourceSubject = subject;
