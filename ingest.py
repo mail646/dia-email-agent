@@ -103,6 +103,12 @@ For each item you extract, identify:
   - Only use "All" when the email is genuinely whole-school, or you truly cannot tell which stage/year it targets.
   - Do not default to "All" or to a broad stage tag just because a range of years is mentioned — pick the exact
     years, or "Kindergarten"/"Primary"/"Secondary", based on what's actually stated.
+- Whether it's addressed to ONE SPECIFIC HOMEROOM CLASS rather than a whole year group -- schools often send
+  class-specific emails (e.g. "Dear parents of [Student] in 5A", "Welcome to 8C", "5B Parent Rep"). If the
+  email clearly targets one specific class like this, set "class_group" to that class (e.g. "5A", "8C").
+  Otherwise (it applies to the whole year group, several classes, or you can't tell), set "class_group" to
+  null. Getting this right matters: a "Welcome to 5B" email should NOT show up for a parent whose child is in
+  5A, even though both are Year 5 -- only actually class-specific emails should carry a class_group value.
 - Which topic it belongs to (choose exactly one from: {", ".join(TOPICS)}):
   - "Academics": tests, exams, assignments/homework due, academic assessments (e.g. CAT4), and the release of
     report cards, exam results, or parent reports.
@@ -128,6 +134,7 @@ Respond ONLY with a single JSON object (no markdown fences, no preamble) with ex
   "date": "YYYY-MM-DD or null if no specific date",
   "category": "deadline | event | task | announcement",
   "year_group": "one of the allowed values above",
+  "class_group": "a specific homeroom class like '5A' or '8C' if this email targets only that class, else null",
   "topic": "one of the allowed topic values above",
   "summary": "1-2 sentence summary of what the parent needs to know or do",
   "conflict_note": "explanation if this superseded an earlier conflicting mention, else null"
@@ -204,7 +211,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
-    for col in ["topic", "conflict_note", "attachment_files"]:
+    for col in ["topic", "conflict_note", "attachment_files", "class_group"]:
         if col not in existing_cols:
             try:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
@@ -1094,16 +1101,17 @@ def save_events(conn, email_data, events):
     attachment_files = email_data.get("attachment_files", "")
     for ev in events:
         conn.execute("""
-            INSERT INTO events (source_message_id, title, date, category, year_group, topic,
+            INSERT INTO events (source_message_id, title, date, category, year_group, class_group, topic,
                                  summary, conflict_note, email_subject, email_sender, email_date,
                                  attachment_files, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             email_data["message_id"],
             ev.get("title"),
             ev.get("date"),
             ev.get("category"),
             ev.get("year_group"),
+            ev.get("class_group"),
             ev.get("topic"),
             ev.get("summary"),
             ev.get("conflict_note"),
