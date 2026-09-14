@@ -156,10 +156,18 @@ If an email covers multiple distinct items, produce multiple "items" objects wit
 """
 
 
+IMAP_TIMEOUT_SECONDS = 60  # hard cap on any single IMAP network operation
+
+
 def imap_connect():
     if not ICLOUD_APP_PASSWORD or "xxxx" in ICLOUD_APP_PASSWORD:
         sys.exit("ERROR: set ICLOUD_APP_PASSWORD")
-    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    # Without an explicit timeout, a dropped/stuck connection to iCloud's
+    # server can make Python wait forever for a response that's never
+    # coming -- this is what caused runs to hang for hours instead of
+    # failing cleanly. Every other network call in this script (Gemini,
+    # link-fetching) already has a timeout; this was the one gap.
+    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=IMAP_TIMEOUT_SECONDS)
     conn.login(ICLOUD_EMAIL, ICLOUD_APP_PASSWORD)
     return conn
 
