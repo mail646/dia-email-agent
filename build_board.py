@@ -206,24 +206,19 @@ def build_html(rows, email_log_rows=None):
 
   <div class="toolbar" id="childChips"></div>
   <input type="text" id="search" placeholder="Search titles, summaries..." oninput="render()">
-  <div class="toolbar" id="topicChips"></div>
 
   <div class="tabs">
+    <div class="tab" data-view="summaries" onclick="switchTab('summaries')">All Items</div>
     <div class="tab active" data-view="deadlines" onclick="switchTab('deadlines')">Deadlines</div>
     <div class="tab" data-view="events" onclick="switchTab('events')">Events</div>
     <div class="tab" data-view="calendar" onclick="switchTab('calendar')">Calendar</div>
-    <div class="tab" data-view="summaries" onclick="switchTab('summaries')">All Items</div>
-    <div class="tab" data-view="emaillog" onclick="switchTab('emaillog')">Email Summaries</div>
-    <div class="tab" data-view="stats" onclick="switchTab('stats')">Stats</div>
   </div>
 
   <h2 class="section-title" id="sectionTitle">Deadlines</h2>
+  <div class="view" id="view-summaries"></div>
   <div class="view active" id="view-deadlines"></div>
   <div class="view" id="view-events"></div>
   <div class="view" id="view-calendar"></div>
-  <div class="view" id="view-summaries"></div>
-  <div class="view" id="view-emaillog"></div>
-  <div class="view" id="view-stats"></div>
 
   <div class="source-overlay" id="sourceOverlay" onclick="if(event.target===this) closeSource()">
     <div class="source-card">
@@ -242,7 +237,7 @@ def build_html(rows, email_log_rows=None):
 const DATA = {data_json};
 const EMAIL_LOG = {email_log_json};
 const CATEGORY_COLORS = {{deadline:'#c0392b', event:'#1a7a6a', task:'#c98a1c', announcement:'#8a8a8e'}};
-const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items', emaillog:'Email Summaries', stats:'Stats'}};
+const TITLES = {{deadlines:'Deadlines', events:'Events', calendar:'Calendar', summaries:'All Items'}};
 
 // Maps the old 7-value topic taxonomy onto the current 3-category system, so
 // the board only ever shows Academics/School Info/Activities chips even if
@@ -358,7 +353,6 @@ function matchesFilters(item) {{
     const haystack = `${{item.title}} ${{item.summary}} ${{item.year_group}}`.toLowerCase();
     if (!fuzzyIncludes(haystack, q)) return false;
   }}
-  if (activeTopic !== 'All' && normalizeTopic(item.topic) !== activeTopic) return false;
   if (activeChild !== 'All') {{
     const child = CHILDREN.find(c => c.id === activeChild);
     const yg = item.year_group || '';
@@ -535,107 +529,6 @@ function changeMonth(delta) {{
   renderCalendar();
 }}
 
-function renderEmailLog() {{
-  const q = document.getElementById('search').value.toLowerCase().trim();
-  let entries = EMAIL_LOG.filter(e => {{
-    if (activeTopic !== 'All' && normalizeTopic(e.topic) !== activeTopic) return false;
-    if (q) {{
-      const haystack = `${{e.subject || ''}} ${{e.summary || ''}}`.toLowerCase();
-      if (!fuzzyIncludes(haystack, q)) return false;
-    }}
-    return true;
-  }});
-  entries.sort((a, b) => (new Date(b.email_date) - new Date(a.email_date)) || 0);
-
-  if (entries.length === 0) {{
-    document.getElementById('view-emaillog').innerHTML = '<div class="empty">No emails logged yet.</div>';
-    return;
-  }}
-
-  const html = entries.map(e => {{
-    const todoBadge = e.has_actionable ? '<span class="tag tag-todo">TO DO</span>' : '';
-    const attachments = e.attachment_files ? ` · [${{e.attachment_files}}]` : '';
-    let dateStr = '';
-    try {{ dateStr = new Date(e.email_date).toLocaleDateString('en-GB', {{day:'numeric', month:'short'}}); }} catch (err) {{}}
-    return `<div class="item">
-      <div class="urgency-bar" style="background:var(--line)"></div>
-      <div class="item-body">
-        <div class="rel muted">${{dateStr}}</div>
-        <div>
-          <div class="item-title">${{e.subject || '(no subject)'}}</div>
-          <div class="item-summary">${{e.summary || ''}}</div>
-          <div class="item-meta">
-            <span class="tag">${{normalizeTopic(e.topic)}}</span>${{todoBadge}}${{attachments}}
-          </div>
-        </div>
-      </div>
-    </div>`;
-  }}).join('');
-
-  document.getElementById('view-emaillog').innerHTML = html;
-}}
-
-function renderStats() {{
-  const totalEmails = EMAIL_LOG.length;
-  const withActionable = EMAIL_LOG.filter(e => e.has_actionable).length;
-  const noActionable = totalEmails - withActionable;
-  const totalItems = DATA.length;
-
-  const topicCounts = {{}};
-  CANONICAL_TOPICS.forEach(t => topicCounts[t] = 0);
-  DATA.forEach(i => {{
-    const t = normalizeTopic(i.topic);
-    topicCounts[t] = (topicCounts[t] || 0) + 1;
-  }});
-
-  const categoryCounts = {{}};
-  DATA.forEach(i => {{
-    const c = i.category || 'other';
-    categoryCounts[c] = (categoryCounts[c] || 0) + 1;
-  }});
-
-  const childCounts = {{}};
-  CHILDREN.filter(c => c.id !== 'All').forEach(child => {{
-    childCounts[child.label] = DATA.filter(i => {{
-      const yg = i.year_group || '';
-      return yg === 'All' || yg === child.stage || child.years.includes(yg);
-    }}).length;
-  }});
-
-  let dateRangeStr = '—';
-  const validDates = EMAIL_LOG.map(e => new Date(e.email_date)).filter(d => !isNaN(d));
-  if (validDates.length > 0) {{
-    const minD = new Date(Math.min(...validDates));
-    const maxD = new Date(Math.max(...validDates));
-    const fmt = d => d.toLocaleDateString('en-GB', {{day:'numeric', month:'short', year:'numeric'}});
-    dateRangeStr = `${{fmt(minD)}} – ${{fmt(maxD)}}`;
-  }}
-
-  const statCard = (label, value) => `<div class="stat-card"><div class="stat-value">${{value}}</div><div class="stat-label">${{label}}</div></div>`;
-
-  let html = '<div class="stats-grid">';
-  html += statCard('Emails processed', totalEmails);
-  html += statCard('With actionable items', withActionable);
-  html += statCard('No action needed', noActionable);
-  html += statCard('Total items extracted', totalItems);
-  html += '</div>';
-
-  html += '<h3 class="stats-subhead">By topic</h3><div class="stats-grid">';
-  CANONICAL_TOPICS.forEach(t => {{ html += statCard(t, topicCounts[t] || 0); }});
-  html += '</div>';
-
-  html += '<h3 class="stats-subhead">By category</h3><div class="stats-grid">';
-  Object.keys(categoryCounts).forEach(c => {{ html += statCard(c.charAt(0).toUpperCase() + c.slice(1) + 's', categoryCounts[c]); }});
-  html += '</div>';
-
-  html += '<h3 class="stats-subhead">By child</h3><div class="stats-grid">';
-  Object.keys(childCounts).forEach(label => {{ html += statCard(label, childCounts[label]); }});
-  html += '</div>';
-
-  html += `<div class="stats-daterange">Emails span: <strong>${{dateRangeStr}}</strong></div>`;
-
-  document.getElementById('view-stats').innerHTML = html;
-}}
 
 function switchTab(view) {{
   currentTab = view;
@@ -651,21 +544,6 @@ function render() {{
   renderList('view-events', filtered.filter(i => i.category === 'event'), showPassedEvents, 'toggleEventsPassed()');
   renderList('view-summaries', filtered, true, '');
   if (currentTab === 'calendar') renderCalendar();
-  if (currentTab === 'emaillog') renderEmailLog();
-  if (currentTab === 'stats') renderStats();
-}}
-
-function buildTopicChips() {{
-  const topics = ['All', ...CANONICAL_TOPICS];
-  document.getElementById('topicChips').innerHTML = topics.map(t =>
-    `<div class="chip ${{t === activeTopic ? 'active' : ''}}" onclick="setTopic('${{t}}')">${{t}}</div>`
-  ).join('');
-}}
-
-function setTopic(t) {{
-  activeTopic = t;
-  buildTopicChips();
-  render();
 }}
 
 function buildChildChips() {{
@@ -681,7 +559,6 @@ function setChild(id) {{
 }}
 
 buildChildChips();
-buildTopicChips();
 render();
 </script>
 </body>
