@@ -783,6 +783,24 @@ def force_reprocess_by_keyword(conn, keyword):
     print(f"DEBUG: cleared {len(message_ids)} message(s) matching '{keyword}' for reprocessing")
 
 
+def year_group_tokens(yg):
+    """
+    Splits a (possibly multi-value, comma-separated) year_group string into a
+    set of tokens, then expands any stage-wide tag into its constituent
+    specific years/Kindergarten -- so "Primary" and "Kindergarten, Primary"
+    are recognized as overlapping (they share "Primary" directly, and this
+    expansion also catches cases like "Primary" vs "Year 5" that don't share
+    a literal token but clearly refer to the same population).
+    """
+    tokens = {t.strip() for t in (yg or "").split(",") if t.strip()}
+    expanded = set(tokens)
+    if "Primary" in tokens:
+        expanded.update({"Kindergarten", "Year 1", "Year 2", "Year 3", "Year 4", "Year 5", "Year 6"})
+    if "Secondary" in tokens:
+        expanded.update({f"Year {n}" for n in range(7, 14)})
+    return expanded
+
+
 def dedupe_similar_events(conn):
     """
     Removes duplicate/superseded events that build up when the same recurring
@@ -830,15 +848,16 @@ def dedupe_similar_events(conn):
             title_j, cat_j, yg_j, date_j = (rows[j][1] or ""), rows[j][2], rows[j][3], rows[j][4]
             if cat_j != cat_i:
                 continue
-            # year_group must match exactly, EXCEPT that "All" is treated as
-            # compatible with any other value -- "All" is a strict superset
-            # of every specific year/stage, so a whole-school mention of an
-            # event and a stage-specific mention of the SAME event (matching
-            # date + near-identical title) are almost certainly duplicates,
-            # not two different things. This does not loosen the guard for
-            # two different specific tags (e.g. "Secondary" vs "Year 8"),
-            # which still must match exactly.
-            yg_compatible = (yg_j == yg_i) or yg_i == "All" or yg_j == "All"
+            # year_group must OVERLAP -- not necessarily match exactly. "All"
+            # is compatible with anything (it's a strict superset), and two
+            # multi-value or stage tags that share any specific year/stage
+            # (e.g. "Primary" and "Kindergarten, Primary", or "Primary" and
+            # "Year 5") are treated as the same population, even though the
+            # raw strings differ. Two genuinely disjoint tags (e.g. "Year 5"
+            # vs "Year 8") still correctly fail this check.
+            tokens_i = year_group_tokens(yg_i)
+            tokens_j = year_group_tokens(yg_j)
+            yg_compatible = "All" in tokens_i or "All" in tokens_j or bool(tokens_i & tokens_j)
             if not yg_compatible:
                 continue
             # Dates must both be present AND match -- this is the key guard
