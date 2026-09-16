@@ -440,6 +440,58 @@ def extract_image_urls_from_html(html_text, base_url):
     return urls[:MAX_IMAGES_PER_PAGE]
 
 
+JS_PLACEHOLDER_SIGNS = [
+    "requires javascript", "enable javascript", "please enable scripts",
+    "javascript is disabled", "browser is either blocking scripts",
+]
+
+
+def looks_like_js_placeholder(html_text, visible_text):
+    """
+    Detects the tell-tale sign of a JS-rendered page (like Microsoft Sway)
+    that a plain HTTP fetch can't actually render -- the response is just a
+    thin shell telling the (non-existent) user to enable JavaScript, not the
+    real content. Used to decide whether the more expensive headless-browser
+    fallback is worth attempting for this particular URL.
+    """
+    low = (html_text or "").lower()
+    if any(sign in low for sign in JS_PLACEHOLDER_SIGNS):
+        return True
+    # A suspiciously short amount of visible text on an otherwise normal-
+    # sized HTML response is also a common symptom of a JS shell page.
+    if len(html_text or "") > 500 and len((visible_text or "").strip()) < 200:
+        return True
+    return False
+
+
+def render_page_with_headless_browser(url, timeout_ms=30000):
+    """
+    Falls back to an actual headless browser (Playwright/Chromium) to fetch
+    a page's FULLY RENDERED HTML, for pages that need JavaScript to show
+    their real content (a plain HTTP fetch only gets the empty pre-JS
+    shell for these). Returns the rendered HTML string, or None if this
+    fails for any reason -- callers should treat that as "couldn't get this
+    one" rather than crash the run over a single flaky page load.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+                html = page.content()
+                return html
+            finally:
+                browser.close()
+    except Exception as e:
+        print(f"WARNING: headless-browser render failed for {url}: {e}")
+        return None
+
+
 def fetch_linked_content_text(urls):
     """
     Follows a small number of links found in an email body and pulls text from
@@ -449,11 +501,12 @@ def fetch_linked_content_text(urls):
     calendars/info cards are frequently delivered as graphics, not real text);
     PDFs go through the same full-page OCR pipeline as attachments.
 
-    NOTE: pages that render their content via JavaScript (some newsletter
-    platforms do) may come back mostly blank here, since this does a plain
-    HTTP fetch rather than running a real browser. That's a known gap, not a
-    bug, if a link like that comes back empty -- a real fix would need a
-    headless-browser fetch instead.
+    Pages that need JavaScript to render their real content (some newsletter
+    platforms, e.g. Microsoft Sway, do) come back as an empty "please enable
+    JavaScript" shell from a plain HTTP fetch -- when that's detected, this
+    falls back to actually rendering the page with a real (headless) browser
+    before extracting text/images, at the cost of that one link taking
+    noticeably longer.
     """
     import requests
     blocks = []
@@ -468,11 +521,21 @@ def fetch_linked_content_text(urls):
                 if text and text.strip():
                     blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
             elif "html" in content_type or not content_type:
-                text = html_to_text(resp.text)
+                html_source = resp.text
+                text = html_to_text(html_source)
+
+                if looks_like_js_placeholder(html_source, text):
+                    print(f"DEBUG: '{url}' looks JS-rendered, trying headless-browser fallback...")
+                    rendered_html = render_page_with_headless_browser(url)
+                    if rendered_html:
+                        html_source = rendered_html
+                        text = html_to_text(html_source)
+                        print(f"DEBUG: headless-browser render succeeded for {url}")
+
                 if text and text.strip():
                     blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
 
-                image_urls = extract_image_urls_from_html(resp.text, url)
+                image_urls = extract_image_urls_from_html(html_source, url)
                 for img_url in image_urls:
                     try:
                         img_resp = requests.get(img_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
