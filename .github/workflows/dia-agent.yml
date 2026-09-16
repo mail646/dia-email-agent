@@ -44,7 +44,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
       - name: Install dependencies
-        run: pip install google-generativeai pypdf python-docx pytesseract pillow openpyxl python-pptx pymupdf requests
+        run: pip install google-generativeai pypdf python-docx pytesseract pillow openpyxl python-pptx pymupdf requests playwright
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
 
       - name: Restore cached database
         uses: actions/cache@v4
