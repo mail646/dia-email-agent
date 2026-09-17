@@ -407,20 +407,47 @@ def extract_pdf_link_urls(payload, label=""):
     extraction, so without this, a newsletter like that would only ever
     surface its generic front-page content and never the year-specific
     details (like a spelling homework list) living one click deeper.
+
+    Two extraction methods are combined, because a PDF can make something
+    clickable in more than one way:
+    1. page.get_links() -- catches the common, standard "/URI" link type.
+    2. Scanning every annotation's RAW underlying PDF object text for any
+       http(s) URL -- catches links built other ways (a JavaScript action,
+       a "launch" action, etc.) that get_links() alone does not surface.
+    A link that is real to a human tapping it in a PDF viewer, but invisible
+    to method 1, still has its destination URL sitting somewhere in the raw
+    object bytes -- method 2 is a deliberately low-level, resilient catch-all
+    for exactly that case.
     """
     import pymupdf as fitz
     urls = []
+    seen = set()
+
+    def add_if_new(u):
+        u = u.strip().rstrip(')>"\']')
+        if not u.startswith("http"):
+            return
+        if any(skip in u.lower() for skip in LINK_SKIP_PATTERNS):
+            return
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
     try:
         doc = fitz.open(stream=payload, filetype="pdf")
         for page in doc:
             for link in page.get_links():
                 uri = link.get("uri")
-                if not uri or not uri.startswith("http"):
+                if uri:
+                    add_if_new(uri)
+
+            for annot in page.annots() or []:
+                try:
+                    raw = doc.xref_object(annot.xref, compressed=False)
+                except Exception:
                     continue
-                if any(skip in uri.lower() for skip in LINK_SKIP_PATTERNS):
-                    continue
-                if uri not in urls:
-                    urls.append(uri)
+                for match in re.findall(r'https?://[^\s()<>\[\]"\'\\]+', raw):
+                    add_if_new(match)
         doc.close()
     except Exception as e:
         print(f"WARNING: could not extract embedded links from PDF {label}: {e}")
