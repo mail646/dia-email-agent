@@ -164,11 +164,11 @@ def build_html(rows, email_log_rows=None):
     background: var(--card); border: 1px solid var(--line); border-radius: 8px;
     padding: 7px 14px; cursor: pointer; box-shadow: var(--shadow); font-size: 0.9em;
   }}
-  .cal-grid {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; font-size: 0.72em; }}
+  .cal-grid {{ display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; font-size: 0.72em; }}
   .cal-day-head {{ text-align: center; color: var(--muted); font-weight: 600; padding: 6px 0; font-size: 0.85em; }}
   .cal-cell {{
-    min-height: 64px; border-radius: 8px; padding: 5px; background: var(--card);
-    box-shadow: var(--shadow);
+    min-height: 64px; min-width: 0; border-radius: 8px; padding: 5px; background: var(--card);
+    box-shadow: var(--shadow); overflow: hidden;
   }}
   .cal-cell.other-month {{ opacity: 0.25; box-shadow: none; }}
   .cal-daynum {{ font-weight: 600; font-size: 0.9em; }}
@@ -208,15 +208,15 @@ def build_html(rows, email_log_rows=None):
   <input type="text" id="search" placeholder="Search titles, summaries..." oninput="render()">
 
   <div class="tabs">
-    <div class="tab" data-view="summaries" onclick="switchTab('summaries')">All Items</div>
-    <div class="tab active" data-view="deadlines" onclick="switchTab('deadlines')">Deadlines</div>
+    <div class="tab active" data-view="summaries" onclick="switchTab('summaries')">All Items</div>
+    <div class="tab" data-view="deadlines" onclick="switchTab('deadlines')">Deadlines</div>
     <div class="tab" data-view="events" onclick="switchTab('events')">Events</div>
     <div class="tab" data-view="calendar" onclick="switchTab('calendar')">Calendar</div>
   </div>
 
-  <h2 class="section-title" id="sectionTitle">Deadlines</h2>
-  <div class="view" id="view-summaries"></div>
-  <div class="view active" id="view-deadlines"></div>
+  <h2 class="section-title" id="sectionTitle">All Items</h2>
+  <div class="view active" id="view-summaries"></div>
+  <div class="view" id="view-deadlines"></div>
   <div class="view" id="view-events"></div>
   <div class="view" id="view-calendar"></div>
 
@@ -275,12 +275,18 @@ const CHILDREN = [
 
 let activeTopic = 'All';
 let activeChild = 'All';
-let currentTab = 'deadlines';
+let currentTab = 'summaries';
 let calMonth = new Date();
 let showPassedDeadlines = false;
 let showPassedEvents = false;
 
-function todayStr() {{ return new Date().toISOString().slice(0,10); }}
+function todayStr() {{
+  // Built from LOCAL date parts, not toISOString() (which is always UTC) --
+  // Dubai is UTC+4, so between local midnight and 4am, a UTC-based "today"
+  // would still think it's yesterday.
+  const d = new Date();
+  return `${{d.getFullYear()}}-${{String(d.getMonth()+1).padStart(2,'0')}}-${{String(d.getDate()).padStart(2,'0')}}`;
+}}
 
 function daysUntil(dateStr) {{
   if (!dateStr) return null;
@@ -552,11 +558,15 @@ function changeMonth(delta) {{
 }}
 
 
+function syncTabClasses() {{
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === currentTab));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + currentTab));
+  document.getElementById('sectionTitle').textContent = TITLES[currentTab];
+}}
+
 function switchTab(view) {{
   currentTab = view;
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
-  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
-  document.getElementById('sectionTitle').textContent = TITLES[view];
+  syncTabClasses();
   render();
 }}
 
@@ -581,6 +591,7 @@ function setChild(id) {{
 }}
 
 buildChildChips();
+syncTabClasses();
 render();
 </script>
 </body>
