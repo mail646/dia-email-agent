@@ -776,16 +776,30 @@ def fetch_new_school_emails(imap_conn, db_conn, total_limit=TOTAL_EMAIL_LIMIT):
                 continue
             current_folder = cand["folder"]
 
-        status, msg_data = imap_conn.fetch(cand["num"], "(RFC822)")
-        if status != "OK" or not msg_data or not msg_data[0]:
-            continue
-        raw_email = msg_data[0][1]
-        if not raw_email:
-            continue
-        msg = email.message_from_bytes(raw_email)
+        # Everything from here through body/attachment extraction is wrapped:
+        # IMAP servers occasionally return a malformed/unexpected response
+        # shape for a single message (observed: a plain bytes object instead
+        # of the expected (metadata, literal) tuple, which crashes with
+        # "'int' object has no attribute 'decode'" when indexed like a
+        # tuple). One oddball email must never take down an entire run that
+        # may have already done many minutes of real work -- skip it and
+        # keep going instead.
+        try:
+            status, msg_data = imap_conn.fetch(cand["num"], "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw_email = msg_data[0][1]
+            if not raw_email or not isinstance(raw_email, bytes):
+                print(f"WARNING: skipping '{cand['subject'][:60]}' -- IMAP returned an unexpected "
+                      f"response shape instead of the raw message bytes")
+                continue
+            msg = email.message_from_bytes(raw_email)
 
-        print(f"DEBUG: reading '{cand['subject'][:60]}' from '{cand['folder']}' (extracting attachments/images/HTML)...")
-        body, attachment_text, attachment_filenames = get_email_body_and_attachments(msg)
+            print(f"DEBUG: reading '{cand['subject'][:60]}' from '{cand['folder']}' (extracting attachments/images/HTML)...")
+            body, attachment_text, attachment_filenames = get_email_body_and_attachments(msg)
+        except Exception as e:
+            print(f"WARNING: skipping '{cand['subject'][:60]}' after an error while fetching/reading it: {e}")
+            continue
 
         emails.append({
             "message_id": cand["message_id"],
