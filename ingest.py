@@ -26,6 +26,13 @@ import google.generativeai as genai
 from PIL import Image
 import pytesseract
 
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()  # lets PIL open .heic/.heif -- the default
+    # photo format on iPhones, which parents very often forward attachments in
+except ImportError:
+    pass
+
 ICLOUD_EMAIL = os.environ.get("ICLOUD_EMAIL", "your_icloud_email@icloud.com")
 ICLOUD_APP_PASSWORD = os.environ.get("ICLOUD_APP_PASSWORD", "xxxx-xxxx-xxxx-xxxx")
 IMAP_SERVER = "imap.mail.me.com"
@@ -50,7 +57,7 @@ GEMINI_CHUNK_SIZE = 1  # emails per Gemini call. Steady-state volume from the sc
                         # still working through a large backlog, to conserve quota
                         # across many older emails at once.
 SKIP_FOLDER_KEYWORDS = ["trash", "junk", "deleted", "sent", "draft", "notes"]
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".heic", ".heif")
 
 # Specific years, plus the two broader stage-wide tags, plus "All" for
 # genuinely whole-school items. Primary = Years 1-6, Secondary = Years 7-13
@@ -390,11 +397,43 @@ def extract_pdf_bytes_text(payload, label=""):
     return "\n".join(text_parts)
 
 
+def extract_pdf_link_urls(payload, label=""):
+    """
+    Pulls clickable hyperlinks OUT of a PDF (as opposed to its visible text).
+    Some school newsletters are a master PDF whose real per-year-group content
+    sits behind a grid of clickable links -- e.g. a "Comm's Corner" page with
+    one link each for KG1, KG2, Year 1, Year 2, ... Year 6 -- rather than in
+    the master PDF's own body text. Those links are invisible to plain text
+    extraction, so without this, a newsletter like that would only ever
+    surface its generic front-page content and never the year-specific
+    details (like a spelling homework list) living one click deeper.
+    """
+    import pymupdf as fitz
+    urls = []
+    try:
+        doc = fitz.open(stream=payload, filetype="pdf")
+        for page in doc:
+            for link in page.get_links():
+                uri = link.get("uri")
+                if not uri or not uri.startswith("http"):
+                    continue
+                if any(skip in uri.lower() for skip in LINK_SKIP_PATTERNS):
+                    continue
+                if uri not in urls:
+                    urls.append(uri)
+        doc.close()
+    except Exception as e:
+        print(f"WARNING: could not extract embedded links from PDF {label}: {e}")
+    return urls
+
+
 LINK_SKIP_PATTERNS = [
     "unsubscribe", "mailto:", "facebook.com", "twitter.com", "x.com", "instagram.com",
     "linkedin.com", "youtube.com", "tiktok.com",
 ]
-MAX_LINKS_PER_EMAIL = 4
+MAX_LINKS_PER_EMAIL = 12  # newsletters routinely have 7-10+ real content links
+# (e.g. one per year group in a "Comm's Corner"-style grid); the old cap of 4
+# was low enough that a genuinely relevant link could be silently dropped.
 MAX_LINK_BYTES = 8 * 1024 * 1024  # 8 MB safety cap
 MAX_IMAGES_PER_PAGE = 6  # cap how many embedded images per linked page get OCR'd
 
@@ -402,13 +441,21 @@ MAX_IMAGES_PER_PAGE = 6  # cap how many embedded images per linked page get OCR'
 def extract_links_from_text(html_body, plain_body):
     """Pulls http(s) links out of an email's HTML/plain body, filtering out
     obvious non-content links (unsubscribe, social media, etc.), capped to a
-    small number per email to bound fetch time/cost."""
-    urls = set()
+    small number per email to bound fetch time/cost. Order is preserved as
+    first-encountered rather than an unordered set, so if the cap is ever
+    actually hit, it deterministically keeps the earliest (usually most
+    prominent) links rather than an arbitrary subset."""
+    urls = []
+    seen = set()
     for text in (html_body or "", plain_body or ""):
-        for match in re.findall(r'href=["\']((?:https?:)?//[^"\']+)["\']', text, re.IGNORECASE):
-            urls.add(match if match.startswith("http") else "https:" + match)
-        for match in re.findall(r'(https?://[^\s<>"\')]+)', text):
-            urls.add(match.rstrip('.,);'))
+        found = re.findall(r'href=["\']((?:https?:)?//[^"\']+)["\']', text, re.IGNORECASE)
+        found += re.findall(r'(https?://[^\s<>"\')]+)', text)
+        for match in found:
+            u = match if match.startswith("http") else "https:" + match
+            u = u.rstrip('.,);')
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
     filtered = []
     for u in urls:
         low = u.lower()
@@ -492,7 +539,10 @@ def render_page_with_headless_browser(url, timeout_ms=30000):
         return None
 
 
-def fetch_linked_content_text(urls):
+MAX_PDF_EMBEDDED_LINKS = 10  # cap on how many links found INSIDE a linked PDF get followed
+
+
+def fetch_linked_content_text(urls, _depth=0):
     """
     Follows a small number of links found in an email body and pulls text from
     what they point to -- some school newsletters put the actual content on a
@@ -507,19 +557,42 @@ def fetch_linked_content_text(urls):
     falls back to actually rendering the page with a real (headless) browser
     before extracting text/images, at the cost of that one link taking
     noticeably longer.
+
+    A linked PDF's own CLICKABLE LINKS are also followed, one level deep only
+    (_depth guards against an unbounded chain) -- some newsletters are a
+    master PDF whose real content sits behind a further link (e.g. a
+    year-group-specific page linked from a "Comm's Corner" grid), which plain
+    text/OCR extraction of the master PDF alone would never surface.
     """
     import requests
     blocks = []
     for url in urls:
         try:
             resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200 or len(resp.content) > MAX_LINK_BYTES:
+            if resp.status_code != 200:
+                print(f"WARNING: linked content '{url}' returned HTTP {resp.status_code}, skipping")
+                continue
+            if len(resp.content) > MAX_LINK_BYTES:
+                print(f"WARNING: linked content '{url}' is {len(resp.content)} bytes, "
+                      f"over the {MAX_LINK_BYTES} byte cap -- skipping")
                 continue
             content_type = resp.headers.get("Content-Type", "").lower()
             if "pdf" in content_type or url.lower().endswith(".pdf"):
                 text = extract_pdf_bytes_text(resp.content, url)
                 if text and text.strip():
                     blocks.append(f"--- Linked content: {url} ---\n{text.strip()}")
+                    print(f"DEBUG: extracted {len(text.strip())} chars of text from linked PDF {url}")
+                else:
+                    print(f"WARNING: linked PDF '{url}' produced no extractable text "
+                          f"(likely a scanned/image-only PDF, or extraction failed)")
+
+                if _depth == 0:
+                    pdf_links = extract_pdf_link_urls(resp.content, url)[:MAX_PDF_EMBEDDED_LINKS]
+                    if pdf_links:
+                        print(f"DEBUG: found {len(pdf_links)} embedded link(s) inside PDF {url}, following them...")
+                        nested = fetch_linked_content_text(pdf_links, _depth=1)
+                        if nested:
+                            blocks.append(nested)
             elif "html" in content_type or not content_type:
                 html_source = resp.text
                 text = html_to_text(html_source)
@@ -550,8 +623,10 @@ def fetch_linked_content_text(urls):
                     except Exception as e:
                         blocks.append(f"[Could not fetch/OCR embedded image {img_url}: {e}]")
             else:
+                print(f"DEBUG: linked content '{url}' has content-type '{content_type}', not PDF/HTML -- skipping")
                 continue
         except Exception as e:
+            print(f"WARNING: error fetching linked content '{url}': {e}")
             blocks.append(f"[Could not fetch linked content {url}: {e}]")
     return "\n\n".join(blocks)
 
@@ -560,6 +635,7 @@ def extract_attachment_text(part):
     filename = part.get_filename() or ""
     payload = part.get_payload(decode=True)
     if not payload:
+        print(f"WARNING: attachment '{filename}' has no readable payload, skipping")
         return ""
     lower = filename.lower()
     content_type = part.get_content_type()
@@ -570,7 +646,21 @@ def extract_attachment_text(part):
         elif lower.endswith(".docx") or "wordprocessingml.document" in content_type:
             import docx
             doc = docx.Document(io.BytesIO(payload))
-            return "\n".join(p.text for p in doc.paragraphs)
+            text_parts = [p.text for p in doc.paragraphs]
+            # Word docs can carry a photo/flyer as an embedded image rather
+            # than real text -- OCR every embedded image too, the same way
+            # a PDF or slide deck's images already are, so nothing in a
+            # docx attachment is silently missed just because it's a picture.
+            try:
+                for i, rel in enumerate(doc.part.rels.values()):
+                    if "image" in rel.reltype:
+                        img_bytes = rel.target_part.blob
+                        ocr_text = ocr_image_bytes(img_bytes, f"{filename} image {i+1}")
+                        if ocr_text and not ocr_text.startswith("[Could not"):
+                            text_parts.append(f"[OCR from embedded image {i+1}]\n{ocr_text}")
+            except Exception as e:
+                text_parts.append(f"[Could not OCR images embedded in {filename}: {e}]")
+            return "\n".join(text_parts)
 
         elif lower.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in content_type:
             import openpyxl
@@ -606,15 +696,30 @@ def extract_attachment_text(part):
                             pass
             return "\n".join(text_parts)
 
-        elif lower.endswith(".txt") or content_type == "text/plain":
+        elif lower.endswith((".txt", ".rtf")) or content_type == "text/plain":
+            return payload.decode("utf-8", errors="ignore")
+
+        elif lower.endswith(".csv") or content_type == "text/csv":
             return payload.decode("utf-8", errors="ignore")
 
         elif lower.endswith(IMAGE_EXTENSIONS) or content_type.startswith("image/"):
             ocr_text = ocr_image_bytes(payload, filename)
             return f"[OCR from image {filename}]\n{ocr_text}" if ocr_text else ""
+
+        else:
+            # Anything not covered above (video, audio, .pages/.key/.numbers,
+            # zip archives, etc.) previously vanished here with zero trace.
+            # We still can't extract text from most of these, but at least
+            # this makes the gap visible in the log instead of invisible --
+            # a parent (or future debugging session) can see exactly which
+            # attachment got skipped and why, rather than data just disappearing.
+            print(f"WARNING: attachment '{filename}' (type: {content_type}) has no extraction "
+                  f"path -- its content is NOT included. Recognized types: PDF, DOCX, XLSX/XLSM, "
+                  f"PPTX, TXT/RTF, CSV, and images (incl. HEIC).")
+            return ""
     except Exception as e:
+        print(f"WARNING: error extracting attachment '{filename}': {e}")
         return f"[Could not extract {filename}: {e}]"
-    return ""
 
 
 def get_email_body_and_attachments(msg):
