@@ -596,6 +596,12 @@ def fetch_linked_content_text(urls, _depth=0):
     for url in urls:
         try:
             resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.url != url:
+                # Tracking-redirect links (SendGrid, etc.) show a friendly
+                # destination as the link TEXT but point the real href at a
+                # redirector -- without this, the log only ever shows the
+                # redirector's URL, never the page actually being read.
+                print(f"DEBUG: '{url}' redirected to '{resp.url}'")
             if resp.status_code != 200:
                 print(f"WARNING: linked content '{url}' returned HTTP {resp.status_code}, skipping")
                 continue
