@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import re
+import hashlib
 import html as html_module
 from datetime import datetime, timezone
 import io
@@ -209,6 +210,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS processed_messages (
             message_id TEXT PRIMARY KEY,
             processed_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS link_content_hashes (
+            url TEXT PRIMARY KEY,
+            content_hash TEXT,
+            last_checked TEXT
         )
     """)
     existing_processed_cols = {row[1] for row in conn.execute("PRAGMA table_info(processed_messages)")}
@@ -714,6 +722,57 @@ def fetch_newsletter_archive_candidates(archive_url, label):
         if title and url:
             candidates.append((title, url))
     return candidates[:MAX_ARCHIVE_LINKS_PER_PAGE]
+
+
+# Some year-group content lives on a PERSISTENT page (e.g. a Microsoft Sway
+# newsletter) that the teacher updates in place week to week, rather than a
+# new document being created each time -- so unlike the archive PDFs above,
+# checking "have we seen this URL before" doesn't work here, since the URL
+# never changes even though the content genuinely does. These are checked
+# every run regardless, and only treated as newly-actionable when their
+# CONTENT has actually changed since the last run (tracked by content hash).
+# This list also serves as a direct, known-good path to content that's
+# reachable in a browser but whose link could not be automatically
+# discovered from within its parent PDF (see project notes) -- rather than
+# only ever depending on solving that, a confirmed year-group link can be
+# added here directly.
+FIXED_YEAR_GROUP_LINKS = [
+    ("Year 5", "https://sway.cloud.microsoft/jdzXaIQ3OW6pcU6s?ref=Link"),
+]
+
+
+def check_fixed_link_for_new_content(conn, year_group, url):
+    """
+    Fetches a fixed, persistent link and returns its text ONLY if the
+    content has changed since the last time this was checked (by comparing
+    a hash of the extracted text) -- otherwise returns None, so a page that
+    hasn't been updated since last run doesn't get needlessly reprocessed
+    by Gemini every single time.
+    """
+    text = fetch_linked_content_text([url])
+    if not text.strip():
+        print(f"WARNING: fixed link for {year_group} ('{url}') produced no extractable text this run")
+        return None
+
+    new_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    row = conn.execute(
+        "SELECT content_hash FROM link_content_hashes WHERE url = ?", (url,)
+    ).fetchone()
+    old_hash = row[0] if row else None
+
+    conn.execute(
+        "INSERT INTO link_content_hashes (url, content_hash, last_checked) VALUES (?, ?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET content_hash = excluded.content_hash, "
+        "last_checked = excluded.last_checked",
+        (url, new_hash, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+    if new_hash == old_hash:
+        print(f"DEBUG: fixed link for {year_group} unchanged since last check, skipping re-extraction")
+        return None
+    print(f"DEBUG: fixed link for {year_group} has new/changed content since last check")
+    return text
 
 
 def extract_attachment_text(part):
@@ -1500,6 +1559,22 @@ def main():
                 "body": "",
                 "attachment_text": pdf_text,
                 "attachment_files": os.path.basename(pdf_url.split("?")[0]),
+            })
+
+    # Fixed, persistent year-group links (see FIXED_YEAR_GROUP_LINKS) --
+    # checked every run; only turned into a synthetic "email" when their
+    # content has actually changed since last time.
+    for year_group, url in FIXED_YEAR_GROUP_LINKS:
+        new_text = check_fixed_link_for_new_content(db_conn, year_group, url)
+        if new_text:
+            emails.append({
+                "message_id": f"fixedlink:{url}:{datetime.now(timezone.utc).date().isoformat()}",
+                "subject": f"{year_group} Newsletter (updated)",
+                "sender": "year-group-newsletter@diadubai.com (persistent page, checked directly)",
+                "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000"),
+                "body": "",
+                "attachment_text": new_text,
+                "attachment_files": "",
             })
 
     if not emails:
