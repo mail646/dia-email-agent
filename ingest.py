@@ -664,6 +664,58 @@ def fetch_linked_content_text(urls, _depth=0):
     return "\n\n".join(blocks)
 
 
+# The school also publishes every newsletter edition on its own public
+# website, as a plain, direct PDF link with no email, no tracking-redirect
+# wrapper, and no login -- a much simpler and more reliable path to the
+# recurring weekly newsletter than chasing it through an email's SendGrid
+# link and (for Primary) a further link buried inside that PDF. This is a
+# SECOND, independent source for the SAME recurring documents, checked
+# alongside (not instead of) normal email ingestion.
+NEWSLETTER_ARCHIVE_PAGES = [
+    ("Primary", "https://www.diadubai.com/primary-school-newsletter-dia-eh"),
+    ("Secondary", "https://www.diadubai.com/secondary-school-newsletter-dia-eh"),
+]
+MAX_ARCHIVE_LINKS_PER_PAGE = 6  # only the most-recent group of links per page is checked each run
+
+
+def fetch_newsletter_archive_candidates(archive_url, label):
+    """
+    Fetches one of the school's public newsletter archive pages and pulls
+    out the (title, pdf_url) pairs from its FIRST results table -- these
+    pages list editions grouped by term/year, most recent group first, so
+    the first table is always the current term's listing. Only that first
+    table is checked (capped further by MAX_ARCHIVE_LINKS_PER_PAGE) rather
+    than the entire multi-year historical archive, since older editions
+    would already have been captured via email when they were current.
+    """
+    import requests
+    try:
+        resp = requests.get(archive_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            print(f"WARNING: newsletter archive page '{archive_url}' returned HTTP {resp.status_code}")
+            return []
+    except Exception as e:
+        print(f"WARNING: could not fetch newsletter archive page '{archive_url}': {e}")
+        return []
+
+    table_match = re.search(r"<table.*?>.*?</table>", resp.text, re.DOTALL | re.IGNORECASE)
+    if not table_match:
+        print(f"WARNING: no results table found on newsletter archive page '{archive_url}' "
+              f"-- the page's structure may have changed")
+        return []
+
+    candidates = []
+    for m in re.finditer(
+        r'<a[^>]+href="([^"]+\.pdf[^"]*)"[^>]*>(.*?)</a>',
+        table_match.group(0), re.DOTALL | re.IGNORECASE,
+    ):
+        url, raw_title = m.group(1), m.group(2)
+        title = html_module.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
+        if title and url:
+            candidates.append((title, url))
+    return candidates[:MAX_ARCHIVE_LINKS_PER_PAGE]
+
+
 def extract_attachment_text(part):
     filename = part.get_filename() or ""
     payload = part.get_payload(decode=True)
@@ -1028,17 +1080,20 @@ def dedupe_similar_events(conn):
     Removes duplicate/superseded events that build up when the same recurring
     item (e.g. "CCA sign-ups begin") gets mentioned across multiple separate
     emails over time. Two events are only ever considered possible duplicates
-    if they share the same category, year_group, AND a matching, non-null
-    date (two different activities that happen to use similar generic
-    wording, like "CCA Sign-Up" for two different clubs, must NOT be merged
-    just because the wording is similar -- a real duplicate of the same
-    event will also share the same specific date). Undated events are never
-    merged with anything, even if titles are identical, since there's no
-    reliable signal to distinguish a true duplicate from two distinct
-    undated announcements. On top of the date match, titles must also be a
-    very close textual match (>= 0.85 similarity). Within each matched
-    group, keeps only the one tied to the most recent underlying email,
-    deleting the rest.
+    if they share the same category, year_group, AND a compatible date: two
+    dated events must share the exact same date (different dates mean
+    genuinely different occurrences, even with similar wording -- "CCA
+    Sign-Up" for two different clubs, for example); two UNDATED events are
+    NEVER merged with each other, since there's no reliable way to tell a
+    true duplicate from two distinct undated announcements; but an undated
+    event CAN be merged away in favor of a DATED version of the same thing
+    (e.g. an early "sign-ups coming soon" mention, later followed by "sign-
+    ups open Sept 22" in a newer email) -- the dated version is strictly
+    more informative, so there's a real basis to prefer it, unlike the
+    undated-vs-undated case. On top of the date check, titles must also be
+    a very close textual match (>= 0.85 similarity, or a strong substring/
+    word-overlap match). Within each matched group, keeps the most useful
+    version (preferring "All"-tagged, then dated, then most recent).
     """
     rows = conn.execute(
         "SELECT id, title, category, year_group, date, email_date, created_at FROM events"
@@ -1082,13 +1137,19 @@ def dedupe_similar_events(conn):
             yg_compatible = "All" in tokens_i or "All" in tokens_j or bool(tokens_i & tokens_j)
             if not yg_compatible:
                 continue
-            # Dates must both be present AND match -- this is the key guard
-            # against merging genuinely different events that just happen to
-            # use similar generic wording ("CCA Sign-Up" for two different
-            # clubs, for example). Two undated items are NEVER merged, even
-            # with identical titles, since there's no reliable way to tell
-            # a true duplicate from two distinct undated announcements.
-            if not date_i or not date_j or date_i != date_j:
+            # Two undated items are NEVER merged with each other, even with
+            # identical titles -- there's no reliable way to tell a true
+            # duplicate from two distinct undated announcements. But an
+            # undated item CAN be recognized as an early, vague "heads up"
+            # for something a LATER email then gave a firm date for (e.g.
+            # "Tunes on Tuesday Begins" in one week's newsletter, then
+            # "Tunes on Tuesday Start Date: Sept 22" in the next) -- the
+            # dated version is strictly more informative, so this is safe:
+            # unlike two undated items, there's a clear, information-based
+            # reason to prefer one over the other, not just a guess.
+            if date_i and date_j and date_i != date_j:
+                continue
+            if not date_i and not date_j:
                 continue
             title_i_norm = title_i.lower().strip()
             title_j_norm = title_j.lower().strip()
@@ -1106,29 +1167,36 @@ def dedupe_similar_events(conn):
             )
             # Word-overlap: catches cases like "Staff PD Day (Early
             # Dismissal)" vs "Innoventures Education PD Day (Early
-            # Dismissal)" -- the same event named with a different
-            # organizational prefix, sharing most of their meaningful words
-            # but different enough in raw text/substring to miss the checks
-            # above. Requires BOTH a high proportion of shared words AND at
-            # least 3 shared words, so short titles with one incidental
-            # shared word (e.g. "PE" / "PE Day") can't false-positive.
+            # Dismissal)", or "Tunes on Tuesday Begins" vs "Tunes on Tuesday
+            # Start Date" -- the same event named with extra/different
+            # words added, sharing most of the SHORTER title's meaningful
+            # words even though the longer title adds enough extra words
+            # that a union-based ratio would under-count the match. Requires
+            # BOTH a high proportion of the shorter title's words to be
+            # shared AND at least 3 shared words, so short titles with one
+            # incidental shared word (e.g. "PE Day" / "PE Uniform Check")
+            # can't false-positive.
             words_i = set(re.findall(r"[a-z0-9]+", title_i_norm))
             words_j = set(re.findall(r"[a-z0-9]+", title_j_norm))
             shared_words = words_i & words_j
             word_overlap = (
-                len(shared_words) / len(words_i | words_j) if (words_i or words_j) else 0
+                len(shared_words) / min(len(words_i), len(words_j))
+                if (words_i and words_j) else 0
             )
-            word_match = word_overlap >= 0.55 and len(shared_words) >= 3
+            word_match = word_overlap >= 0.6 and len(shared_words) >= 3
             if ratio >= 0.85 or substring_match or word_match:
                 group.append(rows[j])
         if len(group) > 1:
             # If the group contains an "All"-tagged version, prefer keeping
             # that one -- it's a strict superset of any narrower tag in the
             # same group, so keeping it never hides the event from anyone
-            # who should see it. Recency is still used as the tiebreak among
-            # whichever subset (All-tagged, or otherwise) applies.
+            # who should see it. Otherwise, prefer a DATED version over an
+            # undated one -- a firm date is strictly more useful than a
+            # vague "coming soon" mention of the same thing. Recency is
+            # still the final tiebreak within whichever pool applies.
             all_tagged = [r for r in group if r[3] == "All"]
-            preferred_pool = all_tagged if all_tagged else group
+            dated = [r for r in group if r[4]]
+            preferred_pool = all_tagged if all_tagged else (dated if dated else group)
             keep = sorted(preferred_pool, key=sort_key, reverse=True)[0]
             for row in group:
                 if row[0] != keep[0]:
@@ -1407,6 +1475,32 @@ def main():
 
     print(f"Fetching emails from: {', '.join(SCHOOL_DOMAINS)}...")
     emails = fetch_new_school_emails(imap_conn, db_conn, total_limit=email_limit)
+
+    # Also check the school's own public newsletter archive pages directly --
+    # a more reliable second source for the SAME recurring weekly newsletters
+    # (see fetch_newsletter_archive_candidates' docstring for why). Each
+    # not-yet-seen edition is wrapped as a synthetic "email" so it flows
+    # through the exact same Gemini extraction and save pipeline as a real
+    # email, unchanged.
+    for label, archive_url in NEWSLETTER_ARCHIVE_PAGES:
+        for title, pdf_url in fetch_newsletter_archive_candidates(archive_url, label):
+            synthetic_id = f"archive:{pdf_url}"
+            if already_processed(db_conn, synthetic_id):
+                continue
+            print(f"DEBUG: found not-yet-seen {label} newsletter on the school website: '{title}'")
+            pdf_text = fetch_linked_content_text([pdf_url])
+            if not pdf_text.strip():
+                print(f"WARNING: '{title}' from the newsletter archive produced no extractable "
+                      f"text -- marking as seen anyway so it isn't retried every run")
+            emails.append({
+                "message_id": synthetic_id,
+                "subject": title,
+                "sender": f"{label.lower()}-school-newsletter-archive@diadubai.com (website archive)",
+                "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000"),
+                "body": "",
+                "attachment_text": pdf_text,
+                "attachment_files": os.path.basename(pdf_url.split("?")[0]),
+            })
 
     if not emails:
         print("No new emails to process.")
