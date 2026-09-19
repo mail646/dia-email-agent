@@ -86,6 +86,17 @@ item, and do not skip smaller or seemingly minor items just because the email is
 a parent would rather see ten small items than miss one that mattered to their child. When in doubt about
 whether something is "actionable enough" to include, include it.
 
+RECURRING CLASSROOM CONTENT WITHOUT AN EXPLICIT "DUE" SENTENCE: some content (a weekly spelling list, a
+reading log, a times-table focus) describes what a class is working on "this week" or "for the week
+commencing [date]" WITHOUT ever using the word "due" or stating an explicit deadline sentence. Treat this as
+an actionable "task" item anyway -- a parent needs to know THIS WEEK's spelling words even though no sentence
+literally says "due Friday". Use the stated week-commencing date (or, if only a bare topic/rule is given with
+no date at all, the date the email itself was sent) as the item's date, and make the title/summary clear that
+it's this week's focus (e.g. "Year 5 Spelling Words (w/c 14 Sept)"). Do not skip this kind of content just
+because it lacks an explicit deadline phrase -- the ABSENCE of "due" wording is not a reason to treat
+something as non-actionable when it's clearly a weekly, recurring task a parent needs to support their child
+with by a natural point in that week.
+
 For each item you extract, identify:
 - Any deadlines, events, tasks, tests/assignments, or announcements with a date attached.
 - Whole-school calendar items too: closures, holidays, early-dismissal days, etc. -- capture these as "event"
