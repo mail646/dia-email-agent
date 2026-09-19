@@ -694,7 +694,7 @@ NEWSLETTER_ARCHIVE_PAGES = [
     ("Primary", "https://www.diadubai.com/primary-school-newsletter-dia-eh"),
     ("Secondary", "https://www.diadubai.com/secondary-school-newsletter-dia-eh"),
 ]
-MAX_ARCHIVE_LINKS_PER_PAGE = 6  # only the most-recent group of links per page is checked each run
+MAX_ARCHIVE_LINKS_PER_PAGE = 2  # small on purpose -- see the priority-ordering note in main()
 
 
 def fetch_newsletter_archive_candidates(archive_url, label):
@@ -1543,15 +1543,40 @@ def main():
     print("Connecting to iCloud Mail...")
     imap_conn = imap_connect()
 
+    # Fixed, persistent year-group links (see FIXED_YEAR_GROUP_LINKS) are
+    # checked FIRST and given priority in the resulting list -- this is a
+    # small, fixed, and important set that needs checking reliably every
+    # run, so it must not be crowded out of the day's Gemini quota by a
+    # larger backlog (real emails, or newsletter-archive catch-up) that
+    # happens to be processed first. Only turned into a synthetic "email"
+    # when content has actually changed since the last check.
+    emails = []
+    for year_group, url in FIXED_YEAR_GROUP_LINKS:
+        new_text = check_fixed_link_for_new_content(db_conn, year_group, url)
+        if new_text:
+            emails.append({
+                "message_id": f"fixedlink:{url}:{datetime.now(timezone.utc).date().isoformat()}",
+                "subject": f"{year_group} Newsletter (updated)",
+                "sender": "year-group-newsletter@diadubai.com (persistent page, checked directly)",
+                "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000"),
+                "body": "",
+                "attachment_text": new_text,
+                "attachment_files": "",
+            })
+
     print(f"Fetching emails from: {', '.join(SCHOOL_DOMAINS)}...")
-    emails = fetch_new_school_emails(imap_conn, db_conn, total_limit=email_limit)
+    emails.extend(fetch_new_school_emails(imap_conn, db_conn, total_limit=email_limit))
 
     # Also check the school's own public newsletter archive pages directly --
     # a more reliable second source for the SAME recurring weekly newsletters
     # (see fetch_newsletter_archive_candidates' docstring for why). Each
     # not-yet-seen edition is wrapped as a synthetic "email" so it flows
     # through the exact same Gemini extraction and save pipeline as a real
-    # email, unchanged.
+    # email, unchanged. Deliberately checked LAST and capped small: on the
+    # first run after this feature was added, EVERY current-term link looks
+    # "not yet seen" at once, which could otherwise consume most of a whole
+    # day's Gemini quota on backlog alone -- something that can safely
+    # finish over a few days is far lower priority than the two sources above.
     for label, archive_url in NEWSLETTER_ARCHIVE_PAGES:
         for title, pdf_url in fetch_newsletter_archive_candidates(archive_url, label):
             synthetic_id = f"archive:{pdf_url}"
@@ -1570,22 +1595,6 @@ def main():
                 "body": "",
                 "attachment_text": pdf_text,
                 "attachment_files": os.path.basename(pdf_url.split("?")[0]),
-            })
-
-    # Fixed, persistent year-group links (see FIXED_YEAR_GROUP_LINKS) --
-    # checked every run; only turned into a synthetic "email" when their
-    # content has actually changed since last time.
-    for year_group, url in FIXED_YEAR_GROUP_LINKS:
-        new_text = check_fixed_link_for_new_content(db_conn, year_group, url)
-        if new_text:
-            emails.append({
-                "message_id": f"fixedlink:{url}:{datetime.now(timezone.utc).date().isoformat()}",
-                "subject": f"{year_group} Newsletter (updated)",
-                "sender": "year-group-newsletter@diadubai.com (persistent page, checked directly)",
-                "date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000"),
-                "body": "",
-                "attachment_text": new_text,
-                "attachment_files": "",
             })
 
     if not emails:
