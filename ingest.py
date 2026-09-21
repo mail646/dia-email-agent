@@ -754,16 +754,26 @@ FIXED_YEAR_GROUP_LINKS = [
 
 def check_fixed_link_for_new_content(conn, year_group, url):
     """
-    Fetches a fixed, persistent link and returns its text ONLY if the
-    content has changed since the last time this was checked (by comparing
-    a hash of the extracted text) -- otherwise returns None, so a page that
-    hasn't been updated since last run doesn't get needlessly reprocessed
-    by Gemini every single time.
+    Fetches a fixed, persistent link and returns (text, new_hash) ONLY if the
+    content has changed since the last time this was SUCCESSFULLY processed
+    (by comparing a hash of the extracted text) -- otherwise returns
+    (None, None), so a page that hasn't been updated since last run doesn't
+    get needlessly reprocessed by Gemini every single time.
+
+    IMPORTANT: this does NOT persist the new hash itself -- it only compares
+    against whatever was last persisted. The caller (main()) must call
+    persist_fixed_link_hash() ONLY after confirming the resulting Gemini
+    extraction actually succeeded. Persisting the hash here, unconditionally,
+    was a real bug: if the fetch succeeds but the Gemini call afterward then
+    fails (e.g. the daily quota is exhausted -- something that reliably
+    happens during heavy backlog/testing days), the content would have been
+    marked "seen" despite never actually being extracted, permanently
+    skipping it on every future run even though it was never truly processed.
     """
     text = fetch_linked_content_text([url])
     if not text.strip():
         print(f"WARNING: fixed link for {year_group} ('{url}') produced no extractable text this run")
-        return None
+        return None, None
 
     new_hash = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     row = conn.execute(
@@ -771,19 +781,24 @@ def check_fixed_link_for_new_content(conn, year_group, url):
     ).fetchone()
     old_hash = row[0] if row else None
 
+    if new_hash == old_hash:
+        print(f"DEBUG: fixed link for {year_group} unchanged since last SUCCESSFULLY processed check, skipping re-extraction")
+        return None, None
+    print(f"DEBUG: fixed link for {year_group} has new/changed content since last successful check")
+    return text, new_hash
+
+
+def persist_fixed_link_hash(conn, url, content_hash):
+    """Called ONLY after the corresponding Gemini extraction for this fixed
+    link's content has actually succeeded -- see check_fixed_link_for_new_content
+    for why persisting the hash any earlier than that is unsafe."""
     conn.execute(
         "INSERT INTO link_content_hashes (url, content_hash, last_checked) VALUES (?, ?, ?) "
         "ON CONFLICT(url) DO UPDATE SET content_hash = excluded.content_hash, "
         "last_checked = excluded.last_checked",
-        (url, new_hash, datetime.now(timezone.utc).isoformat()),
+        (url, content_hash, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
-
-    if new_hash == old_hash:
-        print(f"DEBUG: fixed link for {year_group} unchanged since last check, skipping re-extraction")
-        return None
-    print(f"DEBUG: fixed link for {year_group} has new/changed content since last check")
-    return text
 
 
 def extract_attachment_text(part):
@@ -1088,8 +1103,10 @@ def full_reprocess_wipe(conn):
     conn.execute("DELETE FROM events")
     conn.execute("DELETE FROM processed_messages")
     conn.execute("DELETE FROM email_log")
+    conn.execute("DELETE FROM link_content_hashes")
     conn.commit()
-    print("DEBUG: FULL REPROCESS requested -- wiped all events, processed-message history, and email log")
+    print("DEBUG: FULL REPROCESS requested -- wiped all events, processed-message history, email log, "
+          "and fixed-link content hashes")
 
 
 def force_reprocess_by_keyword(conn, keyword):
@@ -1552,7 +1569,7 @@ def main():
     # when content has actually changed since the last check.
     emails = []
     for year_group, url in FIXED_YEAR_GROUP_LINKS:
-        new_text = check_fixed_link_for_new_content(db_conn, year_group, url)
+        new_text, new_hash = check_fixed_link_for_new_content(db_conn, year_group, url)
         if new_text:
             emails.append({
                 "message_id": f"fixedlink:{url}:{datetime.now(timezone.utc).date().isoformat()}",
@@ -1562,6 +1579,10 @@ def main():
                 "body": "",
                 "attachment_text": new_text,
                 "attachment_files": "",
+                # Not read by save_events/save_email_log (which only access
+                # specific known keys) -- read back after a successful
+                # Gemini call for this email to persist the hash only then.
+                "_fixed_link_hash": (url, new_hash),
             })
 
     print(f"Fetching emails from: {', '.join(SCHOOL_DOMAINS)}...")
@@ -1655,6 +1676,8 @@ def main():
                     save_email_log(db_conn, email_data, log_topic, log_summary, has_actionable)
 
                     mark_processed(db_conn, email_data["message_id"], email_data.get("subject"))
+                    if "_fixed_link_hash" in email_data:
+                        persist_fixed_link_hash(db_conn, *email_data["_fixed_link_hash"])
 
             if chunk_index < len(chunks) - 1:
                 time.sleep(5)  # brief pause between batches to ease rate-limit pressure
